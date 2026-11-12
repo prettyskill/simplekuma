@@ -164,7 +164,7 @@ class CampaignStatsV2Service
             FROM {$clicksTable} cl
             INNER JOIN campaigns cp ON cl.campaign_id = cp.id
             LEFT JOIN traffic_sources ts ON cp.traffic_source_id = ts.id
-            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable) . "
+            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable, true, $this->db) . "
             {$fbJoins}
             WHERE cl.campaign_id = ? AND cl.ts >= ? AND cl.ts <= ?{$filterSql}
         ";
@@ -441,7 +441,7 @@ class CampaignStatsV2Service
             FROM {$clicksTable} cl
             INNER JOIN campaigns cp ON cl.campaign_id = cp.id
             LEFT JOIN traffic_sources ts ON cp.traffic_source_id = ts.id
-            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable) . "
+            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable, true, $this->db) . "
             WHERE cl.campaign_id = ? AND cl.ts >= ? AND cl.ts <= ?{$filterSql}
         ";
 
@@ -1214,7 +1214,8 @@ class CampaignStatsV2Service
     /**
      * @param list<string> $dimensions Ordered dimension keys
      * @param list<array{dimension: string, value: string}> $parentPath
-     * @return array{rows: list<array<string, mixed>>, total: int, page: int, per_page: int, totals: array<string, mixed>, dimension: string, level: int}
+     * @param 'nested'|'flat' $layout Nested expand tree (default) or flat multi-column rows
+     * @return array{rows: list<array<string, mixed>>, total: int, page: int, per_page: int, totals: array<string, mixed>, dimension: string, level: int, layout: string, dimensions: list<string>, has_children: bool}
      */
     public function getBreakdown(
         int $campaignId,
@@ -1228,13 +1229,31 @@ class CampaignStatsV2Service
         string $sort = 'clicks',
         string $order = 'desc',
         ?CampaignStatsQueryFilters $filters = null,
-        bool $metaDelivery = false
+        bool $metaDelivery = false,
+        string $layout = 'nested'
     ): array {
         ReportingQueryCancel::throwIfAborted();
         $filters ??= new CampaignStatsQueryFilters();
         $dimensions = CampaignStatsDimensionRegistry::normalizeDimensionList($dimensions);
         if ($dimensions === []) {
             throw new \InvalidArgumentException('At least one breakdown dimension is required.');
+        }
+
+        $layout = strtolower(trim($layout)) === 'flat' ? 'flat' : 'nested';
+        if ($layout === 'flat') {
+            return $this->getFlatBreakdown(
+                $campaignId,
+                $dateFrom,
+                $dateTo,
+                $timezone,
+                $dimensions,
+                $page,
+                $perPage,
+                $sort,
+                $order,
+                $filters,
+                $metaDelivery
+            );
         }
 
         $level = count($parentPath);
@@ -1252,7 +1271,19 @@ class CampaignStatsV2Service
         $dimension = $dimensions[$level];
         $campaign = (new Campaign($this->db))->getById($campaignId);
         if ($campaign === null) {
-            return ['rows' => [], 'total' => 0, 'page' => $page, 'per_page' => $perPage, 'totals' => [], 'dimension' => $dimension, 'level' => $level];
+            return [
+                'rows' => [],
+                'total' => 0,
+                'page' => $page,
+                'per_page' => $perPage,
+                'totals' => [],
+                'dimension' => $dimension,
+                'level' => $level,
+                'layout' => 'nested',
+                'dimensions' => $dimensions,
+                'has_children' => false,
+                'meta_controls' => false,
+            ];
         }
 
         $this->breakdownService->assertValidGroupBy($dimension, $campaign, $dateFrom, $dateTo, $timezone);
@@ -1330,9 +1361,295 @@ class CampaignStatsV2Service
             'totals' => $totals,
             'dimension' => $dimension,
             'level' => $level,
+            'layout' => 'nested',
+            'dimensions' => $dimensions,
             'has_children' => $level + 1 < count($dimensions),
             'meta_controls' => $controls['enabled'],
         ];
+    }
+
+    /**
+     * Flat multi-dimension breakdown: one row per combination, no expand tree.
+     *
+     * @param list<string> $dimensions
+     * @return array{rows: list<array<string, mixed>>, total: int, page: int, per_page: int, totals: array<string, mixed>, dimension: string, level: int, layout: string, dimensions: list<string>, has_children: bool}
+     */
+    private function getFlatBreakdown(
+        int $campaignId,
+        string $dateFrom,
+        string $dateTo,
+        string $timezone,
+        array $dimensions,
+        int $page,
+        int $perPage,
+        string $sort,
+        string $order,
+        CampaignStatsQueryFilters $filters,
+        bool $metaDelivery
+    ): array {
+        // Single dim flat ≡ nested L0 (same query path).
+        if (count($dimensions) === 1) {
+            $nested = $this->getBreakdown(
+                $campaignId,
+                $dateFrom,
+                $dateTo,
+                $timezone,
+                $dimensions,
+                [],
+                $page,
+                $perPage,
+                $sort,
+                $order,
+                $filters,
+                $metaDelivery,
+                'nested'
+            );
+            $dim = $dimensions[0];
+            foreach ($nested['rows'] as &$row) {
+                $key = (string)($row['group_key'] ?? $row['group'] ?? 'N/A');
+                $name = (string)($row['name'] ?? $row['group_label'] ?? $key);
+                $row['dim_values'] = [
+                    ['dimension' => $dim, 'key' => $key, 'name' => $name],
+                ];
+            }
+            unset($row);
+            $nested['layout'] = 'flat';
+            $nested['has_children'] = false;
+            $nested['dimensions'] = $dimensions;
+
+            return $nested;
+        }
+
+        $days = $this->calendarDaysBetween($dateFrom, $dateTo);
+        if ($days > self::MAX_BREAKDOWN_DAYS) {
+            throw new \RuntimeException(
+                'Date range too large for breakdown (' . $days . ' days). Please use ' . self::MAX_BREAKDOWN_DAYS . ' days or fewer.'
+            );
+        }
+
+        $campaign = (new Campaign($this->db))->getById($campaignId);
+        if ($campaign === null) {
+            return [
+                'rows' => [],
+                'total' => 0,
+                'page' => $page,
+                'per_page' => $perPage,
+                'totals' => [],
+                'dimension' => $dimensions[0],
+                'level' => 0,
+                'layout' => 'flat',
+                'dimensions' => $dimensions,
+                'has_children' => false,
+                'meta_controls' => false,
+            ];
+        }
+
+        foreach ($dimensions as $dimension) {
+            $this->breakdownService->assertValidGroupBy($dimension, $campaign, $dateFrom, $dateTo, $timezone);
+        }
+
+        $utcRange = Formatter::convertDateRangeToUTC($dateFrom, $dateTo, $timezone);
+        $perPage = max(1, min(1000, $perPage));
+        $page = max(1, $page);
+        $filterKeys = $this->filterableKeys($campaignId, $dateFrom, $dateTo, $timezone);
+
+        ReportingQueryCancel::throwIfAborted();
+        $allRows = $this->queryFlatMultiDimensionRows(
+            $campaignId,
+            $dimensions,
+            $dateFrom,
+            $dateTo,
+            $timezone,
+            $utcRange['from'],
+            $utcRange['to'],
+            $filters,
+            $filterKeys,
+            $campaign
+        );
+
+        $result = $this->paginateBreakdownRows(
+            $allRows,
+            'flat',
+            $dateFrom,
+            $dateTo,
+            $page,
+            $perPage,
+            $sort,
+            $order
+        );
+
+        ReportingQueryCancel::throwIfAborted();
+        $summary = $this->getSummary($campaignId, $dateFrom, $dateTo, $timezone, $filters);
+        $totals = [
+            'visitors' => $summary['visitors'],
+            'clicks' => $summary['clicks'],
+            'lp_clicks' => $summary['lp_clicks'] ?? 0,
+            'direct_clicks' => $summary['direct_clicks'] ?? 0,
+            'conversions' => $summary['conversions'],
+            'optins' => $summary['optins'] ?? 0,
+            'conversion_rate' => $summary['conversion_rate'],
+            'ctr' => $summary['ctr'],
+            'cost' => $summary['cost'],
+            'revenue' => $summary['revenue'],
+            'profit' => $summary['profit'],
+            'roi' => $summary['roi'],
+        ];
+
+        // Meta delivery overlays only map cleanly to a single entity dim — skip in flat multi.
+        $controls = ['rows' => $result['rows'], 'enabled' => false];
+        if (count($dimensions) === 1) {
+            $controls = MetaEntityStatus::attach($this->db, $campaign, $dimensions[0], $result['rows']);
+        }
+
+        return [
+            'rows' => $controls['rows'],
+            'total' => $result['total'],
+            'page' => $page,
+            'per_page' => $perPage,
+            'totals' => $totals,
+            'dimension' => $dimensions[0],
+            'level' => 0,
+            'layout' => 'flat',
+            'dimensions' => $dimensions,
+            'has_children' => false,
+            'meta_controls' => $controls['enabled'],
+        ];
+    }
+
+    /**
+     * @param list<string> $dimensions
+     * @param list<string> $filterKeys
+     * @param array<string, mixed>|null $campaign
+     * @return list<array<string, mixed>>
+     */
+    private function queryFlatMultiDimensionRows(
+        int $campaignId,
+        array $dimensions,
+        string $dateFrom,
+        string $dateTo,
+        string $userTimezone,
+        string $utcFrom,
+        string $utcTo,
+        CampaignStatsQueryFilters $filters,
+        array $filterKeys,
+        ?array $campaign
+    ): array {
+        $apiCost = $this->campaignUsesIntegratedApiCost($campaign);
+        if ($apiCost && $filters->requiresScopedCost()) {
+            // Last resort: fall through to nested L0 of first dim only would be wrong.
+            // Use lean multi GROUP BY without scoped joins — proportional Meta overlay after.
+        }
+
+        $utcAligned = Formatter::canUseUtcSummaryDateRange($dateFrom, $dateTo, $utcFrom, $utcTo);
+        if ($utcAligned && $this->preAggregateReader->canUseFlatSummaryBreakdown($dimensions, $filters)) {
+            $summaryDateFrom = substr($utcFrom, 0, 10);
+            $summaryDateTo = substr($utcTo, 0, 10);
+            if (TimezoneSummaryBlend::isSummaryReliable($this->db, [$campaignId], $summaryDateFrom, $summaryDateTo)) {
+                $pre = $this->preAggregateReader->queryFlatDailySummaryBreakdown(
+                    $campaignId,
+                    $dimensions,
+                    $summaryDateFrom,
+                    $summaryDateTo,
+                    $filters
+                );
+                if ($pre !== null) {
+                    if ($apiCost) {
+                        $pre = $this->overlayMappedMetaCostsOnFlatRows(
+                            $campaignId,
+                            $dimensions,
+                            $pre,
+                            $utcFrom,
+                            $utcTo,
+                            $campaign
+                        );
+                    }
+
+                    return $pre;
+                }
+            }
+        }
+
+        $rows = $this->queryLeanFlatBreakdownAggregateRows(
+            $campaignId,
+            $dimensions,
+            $utcFrom,
+            $utcTo,
+            $userTimezone,
+            $dateFrom,
+            $filters,
+            $filterKeys
+        );
+
+        if ($apiCost) {
+            $rows = $this->overlayMappedMetaCostsOnFlatRows(
+                $campaignId,
+                $dimensions,
+                $rows,
+                $utcFrom,
+                $utcTo,
+                $campaign
+            );
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param list<string> $dimensions
+     * @param list<array<string, mixed>> $rows
+     * @param array<string, mixed>|null $campaign
+     * @return list<array<string, mixed>>
+     */
+    private function overlayMappedMetaCostsOnFlatRows(
+        int $campaignId,
+        array $dimensions,
+        array $rows,
+        string $utcFrom,
+        string $utcTo,
+        ?array $campaign
+    ): array {
+        $overlayDim = $dimensions[0];
+        foreach ($dimensions as $dim) {
+            $u = CampaignStatsExpressions::unwrapDimensionKey($dim);
+            if (in_array($u, ['ad_name', 'adset_name', 'ad_id', 'adset_id'], true)) {
+                $overlayDim = $dim;
+                break;
+            }
+        }
+
+        $prepared = [];
+        foreach ($rows as $idx => $row) {
+            $copy = $row;
+            foreach ($row['dim_values'] ?? [] as $dv) {
+                if (($dv['dimension'] ?? '') === $overlayDim) {
+                    $copy['group'] = (string)($dv['name'] ?? $dv['key'] ?? '');
+                    $copy['group_key'] = (string)($dv['key'] ?? '');
+                    break;
+                }
+            }
+            $prepared[$idx] = $copy;
+        }
+
+        $overlaid = $this->overlayMappedMetaCostsOnBreakdownRows(
+            $campaignId,
+            $overlayDim,
+            $prepared,
+            $utcFrom,
+            $utcTo,
+            $campaign,
+            []
+        );
+
+        foreach ($overlaid as $idx => $orow) {
+            if (!isset($rows[$idx])) {
+                continue;
+            }
+            $rows[$idx]['cost'] = $orow['cost'] ?? $rows[$idx]['cost'];
+            $rows[$idx]['profit'] = $orow['profit'] ?? $rows[$idx]['profit'];
+            $rows[$idx]['roi'] = $orow['roi'] ?? $rows[$idx]['roi'];
+        }
+
+        return $rows;
     }
 
     /**
@@ -1654,23 +1971,26 @@ class CampaignStatsV2Service
         string $sort,
         string $order
     ): array {
-        if ($groupBy === 'date') {
-            $allRows = CampaignStatsExpressions::fillDateRangeRows($allRows, $dateFrom, $dateTo);
-            if ($sort === 'clicks') {
-                $sort = 'group';
-                $order = 'asc';
-            }
-        } elseif ($groupBy === 'hour') {
-            $allRows = CampaignStatsExpressions::fillHourRangeRows($allRows);
-            if ($sort === 'clicks') {
-                $sort = 'group';
-                $order = 'asc';
-            }
-        } elseif ($groupBy === 'day_of_week') {
-            $allRows = CampaignStatsExpressions::fillDayOfWeekRows($allRows);
-            if ($sort === 'clicks') {
-                $sort = 'group';
-                $order = 'asc';
+        // Flat multi-dim rows already have every combination; do not fill sparse calendars.
+        if ($groupBy !== 'flat') {
+            if ($groupBy === 'date') {
+                $allRows = CampaignStatsExpressions::fillDateRangeRows($allRows, $dateFrom, $dateTo);
+                if ($sort === 'clicks') {
+                    $sort = 'group';
+                    $order = 'asc';
+                }
+            } elseif ($groupBy === 'hour') {
+                $allRows = CampaignStatsExpressions::fillHourRangeRows($allRows);
+                if ($sort === 'clicks') {
+                    $sort = 'group';
+                    $order = 'asc';
+                }
+            } elseif ($groupBy === 'day_of_week') {
+                $allRows = CampaignStatsExpressions::fillDayOfWeekRows($allRows);
+                if ($sort === 'clicks') {
+                    $sort = 'group';
+                    $order = 'asc';
+                }
             }
         }
 
@@ -1805,7 +2125,7 @@ class CampaignStatsV2Service
             FROM {$clicksTable} cl
             INNER JOIN campaigns cp ON cl.campaign_id = cp.id
             LEFT JOIN traffic_sources ts ON cp.traffic_source_id = ts.id
-            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable) . "
+            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable, true, $this->db) . "
             {$joinOffer}
             {$joinLp}
             {$fbJoins}
@@ -2122,6 +2442,192 @@ class CampaignStatsV2Service
     }
 
     /**
+     * Lean flat multi-dimension GROUP BY (no scoped cost joins).
+     *
+     * @param list<string> $dimensions
+     * @param list<string> $filterKeys
+     * @return list<array<string, mixed>>
+     */
+    private function queryLeanFlatBreakdownAggregateRows(
+        int $campaignId,
+        array $dimensions,
+        string $utcFrom,
+        string $utcTo,
+        string $userTimezone,
+        string $dateFrom,
+        CampaignStatsQueryFilters $filters,
+        array $filterKeys
+    ): array {
+        $timezoneOffset = CampaignStatsExpressions::mysqlTimezoneOffset($userTimezone, $dateFrom);
+        $includedSql = '';
+        if (StatsExclusionFlag::columnExists($this->db, 'clicks')
+            && $this->rangeHasExcludedClicks($campaignId, $utcFrom, $utcTo)
+        ) {
+            $includedSql = ' AND cl.exclude_from_stats = 0';
+        }
+
+        $selectParts = [];
+        $groupParts = [];
+        $joinOffer = false;
+        $joinLp = false;
+        // Multi-dim flat often mixes token JSON + joins; skip FORCE INDEX (optimizer picks).
+        $force = '';
+        foreach ($dimensions as $dim) {
+            if ($dim === 'offer') {
+                $joinOffer = true;
+            }
+            if ($dim === 'landing') {
+                $joinLp = true;
+            }
+        }
+
+        foreach ($dimensions as $i => $dim) {
+            $parts = CampaignStatsExpressions::groupKeyParts($dim, $timezoneOffset);
+            $selectParts[] = "{$parts['expr']} AS dim{$i}_key";
+            if ($parts['label_expr'] !== null) {
+                $selectParts[] = "{$parts['label_expr']} AS dim{$i}_label";
+                $groupParts[] = $parts['expr'];
+                $groupParts[] = $parts['label_expr'];
+            } else {
+                $selectParts[] = "NULL AS dim{$i}_label";
+                $groupParts[] = $parts['expr'];
+            }
+        }
+
+        $joinSql = '';
+        if ($joinOffer) {
+            $joinSql .= ' LEFT JOIN offers o ON o.id = cl.offer_id';
+        }
+        if ($joinLp) {
+            $joinSql .= ' LEFT JOIN landing_pages lp ON lp.id = cl.landing_page_id';
+        }
+
+        [$filterSql, $filterTypes, $filterParams] = $filters->clickFilterSql($this->db, 'cl', $filterKeys, false);
+
+        $sql = '
+            SELECT ' . implode(",\n                       ", $selectParts) . ',
+                       COUNT(*) AS clicks,
+                       SUM(CASE WHEN cl.lp_click = 1 AND cl.landing_page_id IS NOT NULL THEN 1 ELSE 0 END) AS lp_clicks,
+                       SUM(CASE WHEN cl.lp_click = 1 AND cl.landing_page_id IS NULL THEN 1 ELSE 0 END) AS direct_clicks,
+                       COALESCE(SUM(cl.cost), 0) AS manual_cost
+            FROM clicks cl' . $force . '
+            ' . $joinSql . '
+            WHERE cl.campaign_id = ? AND cl.ts >= ? AND cl.ts <= ?' . $includedSql . $filterSql . '
+            GROUP BY ' . implode(', ', $groupParts);
+
+        $types = 'iss' . $filterTypes;
+        $params = array_merge([$campaignId, $utcFrom, $utcTo], $filterParams);
+        $stmt = $this->db->prepare($sql);
+        if ($stmt === false) {
+            return [];
+        }
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        $byKey = [];
+        while ($row = $result->fetch_assoc()) {
+            $dimValues = [];
+            $keyParts = [];
+            $nameParts = [];
+            foreach ($dimensions as $i => $dim) {
+                $key = (string)($row["dim{$i}_key"] ?? 'N/A');
+                $label = $row["dim{$i}_label"] ?? null;
+                if ($dim === 'day_of_week' && ctype_digit($key)) {
+                    $label = CampaignStatsExpressions::formatDayOfWeekLabel((int)$key);
+                }
+                $display = ($label !== null && (string)$label !== '') ? (string)$label : $key;
+                $dimValues[] = [
+                    'dimension' => $dim,
+                    'key' => $key,
+                    'name' => $display,
+                ];
+                $keyParts[] = $key;
+                $nameParts[] = $display;
+            }
+            $composite = implode("\x1f", $keyParts);
+            $byKey[$composite] = [
+                'group_key' => $composite,
+                'group_label' => implode(' › ', $nameParts),
+                'dim_values' => $dimValues,
+                'clicks' => (int)($row['clicks'] ?? 0),
+                'lp_clicks' => (int)($row['lp_clicks'] ?? 0),
+                'direct_clicks' => (int)($row['direct_clicks'] ?? 0),
+                'conversions' => 0,
+                'manual_cost' => (float)($row['manual_cost'] ?? 0),
+                'fb_cost' => 0.0,
+                'ga_cost' => 0.0,
+                'revenue' => 0.0,
+            ];
+        }
+        $stmt->close();
+
+        $convSelect = [];
+        $convGroup = [];
+        foreach ($dimensions as $i => $dim) {
+            $parts = CampaignStatsExpressions::groupKeyParts($dim, $timezoneOffset);
+            $convSelect[] = "{$parts['expr']} AS dim{$i}_key";
+            $convGroup[] = $parts['expr'];
+        }
+        $convSql = '
+            SELECT ' . implode(",\n                       ", $convSelect) . ',
+                   COUNT(*) AS conversions,
+                   COALESCE(SUM(COALESCE(cv.payout, cv.value)), 0) AS revenue
+            FROM clicks cl' . $force . '
+            INNER JOIN conversions cv ON cv.click_id = cl.click_id
+            ' . $joinSql . '
+            WHERE cl.campaign_id = ? AND cl.ts >= ? AND cl.ts <= ?' . $includedSql . $filterSql . '
+            GROUP BY ' . implode(', ', $convGroup);
+        $convStmt = $this->db->prepare($convSql);
+        if ($convStmt !== false) {
+            $convStmt->bind_param($types, ...$params);
+            $convStmt->execute();
+            $convRes = $convStmt->get_result();
+            while ($row = $convRes->fetch_assoc()) {
+                $keyParts = [];
+                foreach ($dimensions as $i => $_) {
+                    $keyParts[] = (string)($row["dim{$i}_key"] ?? 'N/A');
+                }
+                $composite = implode("\x1f", $keyParts);
+                if (!isset($byKey[$composite])) {
+                    $dimValues = [];
+                    $nameParts = [];
+                    foreach ($dimensions as $i => $dim) {
+                        $key = (string)($row["dim{$i}_key"] ?? 'N/A');
+                        $dimValues[] = ['dimension' => $dim, 'key' => $key, 'name' => $key];
+                        $nameParts[] = $key;
+                    }
+                    $byKey[$composite] = [
+                        'group_key' => $composite,
+                        'group_label' => implode(' › ', $nameParts),
+                        'dim_values' => $dimValues,
+                        'clicks' => 0,
+                        'lp_clicks' => 0,
+                        'direct_clicks' => 0,
+                        'conversions' => 0,
+                        'manual_cost' => 0.0,
+                        'fb_cost' => 0.0,
+                        'ga_cost' => 0.0,
+                        'revenue' => 0.0,
+                    ];
+                }
+                $byKey[$composite]['conversions'] = (int)($row['conversions'] ?? 0);
+                $byKey[$composite]['revenue'] = (float)($row['revenue'] ?? 0);
+            }
+            $convStmt->close();
+        }
+
+        $rows = [];
+        foreach ($byKey as $row) {
+            $formatted = $this->formatBreakdownRow($row);
+            $formatted['dim_values'] = $row['dim_values'];
+            $rows[] = $formatted;
+        }
+
+        return $rows;
+    }
+
+    /**
      * Cheap covering-index probe: any exclude_from_stats=1 rows in the window?
      */
     private function rangeHasExcludedClicks(int $campaignId, string $utcFrom, string $utcTo): bool
@@ -2354,7 +2860,7 @@ class CampaignStatsV2Service
             FROM {$clicksTable} cl
             INNER JOIN campaigns cp ON cl.campaign_id = cp.id
             LEFT JOIN traffic_sources ts ON cp.traffic_source_id = ts.id
-            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable) . "
+            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable, true, $this->db) . "
             {$fbJoins}
             WHERE cl.campaign_id = ? AND cl.ts >= ? AND cl.ts <= ?{$filterSql}
             GROUP BY hour
@@ -2707,7 +3213,7 @@ class CampaignStatsV2Service
             FROM {$clicksTable} cl
             INNER JOIN campaigns cp ON cl.campaign_id = cp.id
             LEFT JOIN traffic_sources ts ON cp.traffic_source_id = ts.id
-            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable) . "
+            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable, true, $this->db) . "
             {$fbJoins}
             WHERE cl.campaign_id = ? AND cl.ts >= ? AND cl.ts <= ?{$filterSql}
             GROUP BY day

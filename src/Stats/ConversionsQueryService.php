@@ -52,7 +52,8 @@ class ConversionsQueryService
         string $dateTo,
         string $timezone,
         string $eventTypeFilter = 'all',
-        array $extraFilters = []
+        array $extraFilters = [],
+        ?string $eventKeyExact = null
     ): array {
         $utcRange = Formatter::convertDateRangeToUTC($dateFrom, $dateTo, $timezone);
 
@@ -66,11 +67,19 @@ class ConversionsQueryService
             $types .= 'i';
         }
 
-        $optInList = ConversionOptInClassifier::sqlInList();
-        if ($eventTypeFilter === 'optins') {
-            $where[] = "LOWER(COALESCE(conv.event_key, '')) IN ({$optInList})";
-        } elseif ($eventTypeFilter === 'conversions') {
-            $where[] = "(conv.event_key IS NULL OR LOWER(conv.event_key) NOT IN ({$optInList}))";
+        $eventKeyExact = self::normalizeEventKeyExact($eventKeyExact);
+        if ($eventKeyExact !== null) {
+            // Specific key wins over All / Opt-ins / Conversions buckets.
+            $where[] = 'conv.event_key = ?';
+            $params[] = $eventKeyExact;
+            $types .= 's';
+        } else {
+            $optInList = ConversionOptInClassifier::sqlInList();
+            if ($eventTypeFilter === 'optins') {
+                $where[] = "LOWER(COALESCE(conv.event_key, '')) IN ({$optInList})";
+            } elseif ($eventTypeFilter === 'conversions') {
+                $where[] = "(conv.event_key IS NULL OR LOWER(conv.event_key) NOT IN ({$optInList}))";
+            }
         }
 
         $allowed = array_fill_keys(ConversionPostbackParams::reportKeys(), true);
@@ -92,6 +101,89 @@ class ConversionsQueryService
             'params' => $params,
             'types' => $types,
         ];
+    }
+
+    /**
+     * Distinct non-empty event_key values in the date/campaign window (for filter dropdown).
+     *
+     * @return list<string>
+     */
+    public function listDistinctEventKeys(
+        ?int $campaignId,
+        string $dateFrom,
+        string $dateTo,
+        string $timezone
+    ): array {
+        $filter = $this->buildLogWhere($campaignId, $dateFrom, $dateTo, $timezone, 'all', [], null);
+        $clause = $this->buildLogFromClause();
+        $sql = "
+            SELECT DISTINCT conv.event_key AS event_key
+            FROM {$clause['from']}
+            {$clause['joins']}
+            WHERE {$filter['where']}
+              AND conv.event_key IS NOT NULL
+              AND conv.event_key <> ''
+            ORDER BY conv.event_key ASC
+            LIMIT 200
+        ";
+        $stmt = $this->db->prepare($sql);
+        if ($stmt === false) {
+            return [];
+        }
+        $stmt->bind_param($filter['types'], ...$filter['params']);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $keys = [];
+        while ($row = $result->fetch_assoc()) {
+            $key = trim((string) ($row['event_key'] ?? ''));
+            if ($key !== '') {
+                $keys[] = $key;
+            }
+        }
+        $stmt->close();
+
+        return $keys;
+    }
+
+    /**
+     * Parse UI event_type values: all|optins|conversions|ek:{event_key}.
+     *
+     * @return array{event_type: 'all'|'optins'|'conversions', event_key: ?string}
+     */
+    public static function parseEventTypeParam(?string $raw): array
+    {
+        $raw = trim((string) $raw);
+        if ($raw === '' || $raw === 'all') {
+            return ['event_type' => 'all', 'event_key' => null];
+        }
+        if ($raw === 'optins' || $raw === 'conversions') {
+            return ['event_type' => $raw, 'event_key' => null];
+        }
+        if (str_starts_with($raw, 'ek:')) {
+            $key = self::normalizeEventKeyExact(substr($raw, 3));
+            if ($key !== null) {
+                return ['event_type' => 'all', 'event_key' => $key];
+            }
+        }
+
+        return ['event_type' => 'all', 'event_key' => null];
+    }
+
+    public static function normalizeEventKeyExact(?string $eventKey): ?string
+    {
+        if ($eventKey === null) {
+            return null;
+        }
+        $eventKey = trim($eventKey);
+        if ($eventKey === '' || strlen($eventKey) > 128) {
+            return null;
+        }
+        // Keep printable keys only (reject control chars / path tricks).
+        if (preg_match('/^[\x20-\x7E]+$/', $eventKey) !== 1) {
+            return null;
+        }
+
+        return $eventKey;
     }
 
     private function trafficSourceColumnExists(): bool
@@ -224,7 +316,8 @@ class ConversionsQueryService
         ?int $limit = null,
         ?int $offset = null,
         string $eventTypeFilter = 'all',
-        array $extraFilters = []
+        array $extraFilters = [],
+        ?string $eventKeyExact = null
     ): array {
         if (!in_array($eventTypeFilter, ['all', 'optins', 'conversions'], true)) {
             $eventTypeFilter = 'all';
@@ -235,7 +328,8 @@ class ConversionsQueryService
             $dateTo,
             $timezone,
             $eventTypeFilter,
-            $extraFilters
+            $extraFilters,
+            $eventKeyExact
         );
         $clause = $this->buildLogFromClause();
         $extraSql = $this->extraSelectFragments();
@@ -321,7 +415,8 @@ class ConversionsQueryService
         string $timezone,
         string $eventTypeFilter = 'all',
         array $extraFilters = [],
-        int $maxRows = 500
+        int $maxRows = 500,
+        ?string $eventKeyExact = null
     ): array {
         if (!in_array($eventTypeFilter, ['all', 'optins', 'conversions'], true)) {
             $eventTypeFilter = 'all';
@@ -334,7 +429,8 @@ class ConversionsQueryService
             $dateTo,
             $timezone,
             $eventTypeFilter,
-            $extraFilters
+            $extraFilters,
+            $eventKeyExact
         );
         $clause = $this->buildLogFromClause();
         $extraSql = $this->extraSelectFragments();

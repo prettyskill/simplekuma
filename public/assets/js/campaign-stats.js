@@ -112,6 +112,7 @@
             perPage: state.perPage,
             sort: state.sort,
             order: state.order,
+            layout: state.layout,
         }));
     }
 
@@ -166,6 +167,7 @@
         campaignMeta: null,
         savedViews: [],
         savedViewsUseServer: false,
+        layout: prefs.layout === 'flat' ? 'flat' : 'nested',
     };
 
     const fmtMoney = (n) => {
@@ -537,6 +539,7 @@
             dimensions: state.dimensions.slice(),
             columns: state.visibleColumns.slice(),
             density: state.density,
+            layout: state.layout,
             showTotals: document.getElementById('stats-v2-show-totals')?.checked !== false,
             trafficSourceId: state.trafficSourceId || null,
             offerId: state.offerId || null,
@@ -544,6 +547,37 @@
             tokenParam: state.tokenParam || null,
             tokenValue: state.tokenValue || null,
         };
+    }
+
+    function dimensionLabel(key) {
+        const found = (state.availableDimensions || []).find((d) => d.key === key);
+        if (found && found.label) return found.label;
+        return String(key || '').replace(/^(ts:|token:)/, '').replace(/[_-]/g, ' ');
+    }
+
+    function syncBreakdownNameHeaders() {
+        const head = document.getElementById('stats-v2-breakdown-head');
+        if (!head) return;
+        head.querySelectorAll('th[data-col^="dim-"]').forEach((th) => th.remove());
+        let nameTh = head.querySelector('th[data-col="name"]');
+        if (state.layout === 'flat' && state.dimensions.length > 0) {
+            if (nameTh) nameTh.remove();
+            const frag = document.createDocumentFragment();
+            state.dimensions.forEach((key, idx) => {
+                const th = document.createElement('th');
+                th.dataset.col = 'dim-' + idx;
+                th.textContent = dimensionLabel(key);
+                frag.appendChild(th);
+            });
+            head.insertBefore(frag, head.firstChild);
+        } else {
+            if (!nameTh) {
+                nameTh = document.createElement('th');
+                nameTh.dataset.col = 'name';
+                nameTh.textContent = 'Name';
+                head.insertBefore(nameTh, head.firstChild);
+            }
+        }
     }
 
     function loadAllSavedViewsLocal() {
@@ -712,16 +746,20 @@
                 : defaultColumns.slice()
         );
         state.density = view.density || 'comfortable';
+        state.layout = view.layout === 'flat' ? 'flat' : 'nested';
         const showTotals = document.getElementById('stats-v2-show-totals');
         if (showTotals) {
             showTotals.checked = view.showTotals !== false;
         }
         applyAdvancedFiltersFromView(view);
         document.getElementById('stats-v2-density').value = state.density;
+        const layoutSel = document.getElementById('stats-v2-layout');
+        if (layoutSel) layoutSel.value = state.layout;
         document.getElementById('stats-v2-breakdown-table').classList.toggle('density-compact', state.density === 'compact');
         localStorage.setItem('stats_v2_density', state.density);
         renderDimensionTags();
         populateDimensionSelect();
+        syncBreakdownNameHeaders();
         applyColumnVisibility();
         savePrefs();
         syncDimensionPresetActiveState();
@@ -1082,9 +1120,12 @@
 
     function applyColumnVisibility() {
         const head = document.getElementById('stats-v2-breakdown-head');
+        const dimCols = state.layout === 'flat'
+            ? state.dimensions.map((_, idx) => 'dim-' + idx)
+            : ['name'];
         if (head) {
             const hidden = ALL_METRIC_COLS.filter((col) => !state.visibleColumns.includes(col));
-            const order = ['name'].concat(state.visibleColumns).concat(hidden);
+            const order = dimCols.concat(state.visibleColumns).concat(hidden);
             order.forEach((col) => {
                 const th = head.querySelector(`th[data-col="${col}"]`);
                 if (th) head.appendChild(th);
@@ -1100,12 +1141,12 @@
         const visible = new Set(state.visibleColumns);
         document.querySelectorAll('#stats-v2-breakdown-head [data-col]').forEach((th) => {
             const col = th.dataset.col;
-            if (col === 'name') return;
+            if (col === 'name' || (col && col.indexOf('dim-') === 0)) return;
             th.style.display = visible.has(col) ? '' : 'none';
         });
         document.querySelectorAll('#stats-v2-breakdown-body [data-col]').forEach((td) => {
             const col = td.dataset.col;
-            if (col === 'name') {
+            if (col === 'name' || (col && col.indexOf('dim-') === 0)) {
                 td.style.display = '';
                 return;
             }
@@ -1126,8 +1167,15 @@
         const ctr = t.ctr != null ? Number(t.ctr) : (visitors > 0 ? (lpClicks / visitors) * 100 : 0);
         const botClicks = Number(t.bot_clicks ?? 0) || 0;
         const botPct = t.bot_pct != null ? Number(t.bot_pct) : (visitors > 0 ? (botClicks / visitors) * 100 : 0);
+        const leading = state.layout === 'flat'
+            ? state.dimensions.map((_, idx) => (
+                idx === 0
+                    ? `<td data-col="dim-${idx}">Total</td>`
+                    : `<td data-col="dim-${idx}"></td>`
+            )).join('')
+            : '<td data-col="name"><span class="stats-v2-expand-spacer" aria-hidden="true"></span>Total</td>';
         return `<tr class="total-row${roiCls}">
-            <td data-col="name"><span class="stats-v2-expand-spacer" aria-hidden="true"></span>Total</td>
+            ${leading}
             <td class="num" data-col="visitors">${visitors.toLocaleString()}</td>
             <td class="num" data-col="lp_clicks">${actionClicks.toLocaleString()}</td>
             <td class="num" data-col="ctr">${fmtPct(ctr)}</td>
@@ -1161,10 +1209,19 @@
             return;
         }
 
-        const header = ['Name'].concat(state.visibleColumns.map((col) => COL_LABELS[col] || col));
+        const dimHeaders = state.layout === 'flat'
+            ? state.dimensions.map((key) => dimensionLabel(key))
+            : ['Name'];
+        const header = dimHeaders.concat(state.visibleColumns.map((col) => COL_LABELS[col] || col));
         const lines = [header.join(',')];
         rows.forEach((r) => {
-            const cells = [r.name].concat(state.visibleColumns.map((col) => metricCsvValue(r, col)));
+            const leading = state.layout === 'flat'
+                ? state.dimensions.map((key, idx) => {
+                    const dv = (r.dim_values || [])[idx];
+                    return dv ? (dv.name || dv.key || '') : (idx === 0 ? (r.name || '') : '');
+                })
+                : [r.name];
+            const cells = leading.concat(state.visibleColumns.map((col) => metricCsvValue(r, col)));
             lines.push(cells.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(','));
         });
         const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
@@ -1186,6 +1243,7 @@
                 action: 'breakdown',
                 dimensions: state.dimensions.join(','),
                 parent_path: '[]',
+                layout: state.layout,
                 page,
                 per_page: 200,
                 sort: sortParams.sort,
@@ -1196,6 +1254,7 @@
             (data.rows || []).forEach((row) => {
                 all.push({
                     name: row.name || row.group,
+                    dim_values: row.dim_values || [],
                     clicks: row.clicks,
                     lp_clicks: row.lp_clicks,
                     action_clicks: row.action_clicks,
@@ -1333,9 +1392,10 @@
                 tr.style.display = '';
                 return;
             }
-            const nameCell = tr.querySelector('[data-col="name"]');
-            const text = (nameCell?.textContent || '').toLowerCase();
-            tr.style.display = text.includes(q) ? '' : 'none';
+            const cells = tr.querySelectorAll('[data-col="name"], [data-col^="dim-"]');
+            let text = '';
+            cells.forEach((cell) => { text += ' ' + (cell.textContent || ''); });
+            tr.style.display = text.toLowerCase().includes(q) ? '' : 'none';
         });
     }
 
@@ -1738,13 +1798,25 @@
         const profitCls = row.profit >= 0 ? 'profit-positive' : 'profit-negative';
         const indent = level > 0 ? 'child-row' : '';
         const roiCls = roiRowClass(row);
-        const expandBtn = hasChildren
+        const flat = state.layout === 'flat';
+        const expandBtn = (!flat && hasChildren)
             ? `<button type="button" class="expand-btn" data-expand="${rowId}" aria-label="Expand">${expanded ? '▼' : '▶'}</button>`
             : '<span class="stats-v2-expand-spacer" aria-hidden="true"></span>';
         const botPct = row.bot_pct != null ? Number(row.bot_pct) : (Number(row.clicks) > 0 ? ((Number(row.bot_clicks) || 0) / Number(row.clicks)) * 100 : 0);
         const botClicks = Number(row.bot_clicks || 0);
+        let leading;
+        if (flat) {
+            const vals = Array.isArray(row.dim_values) ? row.dim_values : [];
+            leading = state.dimensions.map((key, idx) => {
+                const dv = vals[idx];
+                const text = dv ? (dv.name || dv.key || '') : (idx === 0 ? (row.name || row.group || '') : '');
+                return `<td data-col="dim-${idx}" title="${escapeHtml(text)}">${escapeHtml(text)}</td>`;
+            }).join('');
+        } else {
+            leading = `<td data-col="name">${expandBtn}<span class="stats-name-wrap"><span class="stats-row-name">${escapeHtml(row.name || row.group)}</span>${metaEntityControlHtml(row)}</span></td>`;
+        }
         return `<tr class="${indent}${roiCls}" data-row-id="${rowId}" data-level="${level}">
-            <td data-col="name">${expandBtn}<span class="stats-name-wrap"><span class="stats-row-name">${escapeHtml(row.name || row.group)}</span>${metaEntityControlHtml(row)}</span></td>
+            ${leading}
             <td class="num" data-col="visitors">${Number(row.clicks).toLocaleString()}</td>
             <td class="num" data-col="lp_clicks">${Number(row.action_clicks != null ? row.action_clicks : ((row.lp_clicks || 0) + (row.direct_clicks || 0))).toLocaleString()}</td>
             <td class="num" data-col="ctr">${fmtPct(rowCtr(row))}</td>
@@ -1971,11 +2043,16 @@
 
     async function runBreakdown(parentPath, level, tbody, afterRow) {
         const sortParams = breakdownSortParams();
+        const flat = state.layout === 'flat';
+        if (level === 0) {
+            syncBreakdownNameHeaders();
+        }
         const params = {
             ...baseParams(),
             action: 'breakdown',
             dimensions: state.dimensions.join(','),
-            parent_path: JSON.stringify(parentPath),
+            parent_path: JSON.stringify(flat ? [] : parentPath),
+            layout: state.layout,
             page: level === 0 ? state.breakdownPage : 1,
             per_page: state.perPage,
             sort: sortParams.sort,
@@ -1987,12 +2064,13 @@
 
         const frag = document.createDocumentFragment();
         const dim = data.dimension;
+        const hasChildren = flat ? false : !!data.has_children;
 
         data.rows.forEach((row) => {
             const rowId = 'r-' + level + '-' + Math.random().toString(36).slice(2, 9);
             const path = parentPath.concat([{ dimension: dim, value: row.group_key || row.group }]);
             const tr = document.createElement('tbody');
-            tr.innerHTML = rowHtml(row, level, rowId, data.has_children, false);
+            tr.innerHTML = rowHtml(row, level, rowId, hasChildren, false);
             const trEl = tr.firstElementChild;
             trEl.dataset.path = JSON.stringify(path);
             frag.appendChild(trEl);
@@ -2002,6 +2080,7 @@
             syncMetaControlsNote(!!data.meta_controls);
             state.exportRows = data.rows.map((row) => ({
                 name: row.name || row.group,
+                dim_values: row.dim_values || [],
                 clicks: row.clicks,
                 lp_clicks: row.lp_clicks,
                 ctr: row.ctr != null ? row.ctr : rowCtr(row),
@@ -2031,9 +2110,11 @@
             applyBreakdownSearch();
         }
 
-        tbody.querySelectorAll('[data-expand]').forEach((btn) => {
-            btn.addEventListener('click', onExpandClick);
-        });
+        if (!flat) {
+            tbody.querySelectorAll('[data-expand]').forEach((btn) => {
+                btn.addEventListener('click', onExpandClick);
+            });
+        }
 
         return data;
     }
@@ -2634,6 +2715,20 @@
         document.getElementById('stats-v2-breakdown-table').classList.toggle('density-compact', state.density === 'compact');
     });
     document.getElementById('stats-v2-breakdown-table').classList.toggle('density-compact', state.density === 'compact');
+
+    const layoutSel = document.getElementById('stats-v2-layout');
+    if (layoutSel) {
+        layoutSel.value = state.layout;
+        layoutSel.addEventListener('change', (e) => {
+            state.layout = e.target.value === 'flat' ? 'flat' : 'nested';
+            savePrefs();
+            syncBreakdownNameHeaders();
+            if (state.tab === 'breakdown' && state.dimensions.length) {
+                state.breakdownPage = 1;
+                loadBreakdown();
+            }
+        });
+    }
 
     document.getElementById('stats-v2-toggle-chart').addEventListener('click', () => {
         state.chartCollapsed = !state.chartCollapsed;

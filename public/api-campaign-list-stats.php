@@ -82,9 +82,9 @@ if ($campaignIds === []) {
     exit;
 }
 
-// Cap to keep abuse / accidental huge requests bounded
-if (count($campaignIds) > 200) {
-    $campaignIds = array_slice($campaignIds, 0, 200);
+// Cap to keep abuse / accidental huge requests bounded (covers Show all for large accounts)
+if (count($campaignIds) > 500) {
+    $campaignIds = array_slice($campaignIds, 0, 500);
 }
 
 $cacheKey = StatsResponseCache::makeKey($userId, 'campaign_list_stats', [

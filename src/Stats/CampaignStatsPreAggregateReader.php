@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace SimpleKuma\Stats;
 
 use mysqli;
+use SimpleKuma\Database\SchemaProbe;
 
 /**
  * Fast-path reads from clicks_daily_summary, clicks_stats_by_token_daily,
@@ -18,99 +19,41 @@ final class CampaignStatsPreAggregateReader
 
     public function dailySummaryTableExists(): bool
     {
-        static $cache = null;
-        if ($cache !== null) {
-            return $cache;
-        }
-        $result = $this->db->query(
-            "SELECT 1 FROM information_schema.TABLES
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'clicks_daily_summary' LIMIT 1"
-        );
-        $cache = $result !== false && $result->num_rows > 0;
-
-        return $cache;
+        return SchemaProbe::tableExists($this->db, 'clicks_daily_summary');
     }
 
     public function tokenDailyTableExists(): bool
     {
-        static $cache = null;
-        if ($cache !== null) {
-            return $cache;
-        }
-        $result = $this->db->query(
-            "SELECT 1 FROM information_schema.TABLES
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'clicks_stats_by_token_daily' LIMIT 1"
-        );
-        $cache = $result !== false && $result->num_rows > 0;
-
-        return $cache;
+        return SchemaProbe::tableExists($this->db, 'clicks_stats_by_token_daily');
     }
 
     public function tokenHourlyTableExists(): bool
     {
-        static $cache = null;
-        if ($cache !== null) {
-            return $cache;
-        }
-        $result = $this->db->query(
-            "SELECT 1 FROM information_schema.TABLES
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'clicks_stats_by_token_hourly' LIMIT 1"
-        );
-        $cache = $result !== false && $result->num_rows > 0;
-
-        return $cache;
+        return SchemaProbe::tableExists($this->db, 'clicks_stats_by_token_hourly');
     }
 
     private function dailySummaryHasOptins(): bool
     {
-        static $cache = null;
-        if ($cache !== null) {
-            return $cache;
-        }
-        if (!$this->dailySummaryTableExists()) {
-            return $cache = false;
-        }
-        $result = $this->db->query("SHOW COLUMNS FROM clicks_daily_summary LIKE 'optins'");
-        return $cache = ($result !== false && $result->num_rows > 0);
+        return $this->dailySummaryTableExists()
+            && SchemaProbe::columnExists($this->db, 'clicks_daily_summary', 'optins');
     }
 
     private function dailySummaryHasBotClicks(): bool
     {
-        static $cache = null;
-        if ($cache !== null) {
-            return $cache;
-        }
-        if (!$this->dailySummaryTableExists()) {
-            return $cache = false;
-        }
-        $result = $this->db->query("SHOW COLUMNS FROM clicks_daily_summary LIKE 'bot_clicks'");
-        return $cache = ($result !== false && $result->num_rows > 0);
+        return $this->dailySummaryTableExists()
+            && SchemaProbe::columnExists($this->db, 'clicks_daily_summary', 'bot_clicks');
     }
 
     private function tokenDailyHasOptins(): bool
     {
-        static $cache = null;
-        if ($cache !== null) {
-            return $cache;
-        }
-        if (!$this->tokenDailyTableExists()) {
-            return $cache = false;
-        }
-        $result = $this->db->query("SHOW COLUMNS FROM clicks_stats_by_token_daily LIKE 'optins'");
-        return $cache = ($result !== false && $result->num_rows > 0);
+        return $this->tokenDailyTableExists()
+            && SchemaProbe::columnExists($this->db, 'clicks_stats_by_token_daily', 'optins');
     }
 
     private function tokenDailyHasBotClicks(): bool
     {
-        static $cache = null;
-        if ($cache !== null) {
-            return $cache;
-        }
-        if (!$this->tokenDailyTableExists()) {
-            return $cache = false;
-        }
-        $result = $this->db->query("SHOW COLUMNS FROM clicks_stats_by_token_daily LIKE 'bot_clicks'");
-        return $cache = ($result !== false && $result->num_rows > 0);
+        return $this->tokenDailyTableExists()
+            && SchemaProbe::columnExists($this->db, 'clicks_stats_by_token_daily', 'bot_clicks');
     }
 
     private function botClicksSumExpr(string $alias = 's'): string
@@ -563,6 +506,151 @@ final class CampaignStatsPreAggregateReader
             $direct = (int)($row['direct_clicks'] ?? 0);
             $formatted['direct_clicks'] = $direct;
             $formatted['action_clicks'] = (int)($row['lp_clicks'] ?? 0) + $direct;
+            $rows[] = $formatted;
+        }
+        $stmt->close();
+
+        return $rows;
+    }
+
+    /**
+     * Flat multi-dim from clicks_daily_summary grain only (date/week/dow + offer + landing).
+     * Token / geo / hour combos are not eligible — callers must use lean/raw.
+     *
+     * @param list<string> $dimensions
+     */
+    public function canUseFlatSummaryBreakdown(array $dimensions, CampaignStatsQueryFilters $filters): bool
+    {
+        if (!$this->dailySummaryTableExists() || $filters->requiresScopedCost() || $filters->hasTokenFilter()) {
+            return false;
+        }
+        if (count($dimensions) < 2) {
+            return false;
+        }
+        $allowed = ['date' => true, 'week' => true, 'day_of_week' => true, 'offer' => true, 'landing' => true];
+        foreach ($dimensions as $dim) {
+            if (!isset($allowed[$dim])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @param list<string> $dimensions
+     * @return list<array<string, mixed>>|null
+     */
+    public function queryFlatDailySummaryBreakdown(
+        int $campaignId,
+        array $dimensions,
+        string $dateFrom,
+        string $dateTo,
+        CampaignStatsQueryFilters $filters
+    ): ?array {
+        if (!$this->canUseFlatSummaryBreakdown($dimensions, $filters)) {
+            return null;
+        }
+
+        [$where, $types, $params] = $this->summaryWhere($campaignId, $dateFrom, $dateTo, $filters, []);
+        $optinsSel = $this->dailySummaryHasOptins() ? 'SUM(s.optins) AS optins,' : '0 AS optins,';
+        $botClicksSel = $this->dailySummaryHasBotClicks() ? 'SUM(s.bot_clicks) AS bot_clicks,' : '0 AS bot_clicks,';
+
+        $selectParts = [];
+        $groupParts = [];
+        $joins = '';
+        $needOffer = in_array('offer', $dimensions, true);
+        $needLanding = in_array('landing', $dimensions, true);
+        if ($needOffer) {
+            $joins .= ' LEFT JOIN offers o ON o.id = s.offer_id';
+        }
+        if ($needLanding) {
+            $joins .= ' LEFT JOIN landing_pages lp ON lp.id = s.landing_page_id';
+        }
+
+        foreach ($dimensions as $i => $dim) {
+            if ($dim === 'date') {
+                $selectParts[] = "s.summary_date AS dim{$i}_key";
+                $selectParts[] = "NULL AS dim{$i}_label";
+                $groupParts[] = 's.summary_date';
+            } elseif ($dim === 'week') {
+                $weekExpr = 'DATE_SUB(s.summary_date, INTERVAL WEEKDAY(s.summary_date) DAY)';
+                $selectParts[] = "{$weekExpr} AS dim{$i}_key";
+                $selectParts[] = "NULL AS dim{$i}_label";
+                $groupParts[] = $weekExpr;
+            } elseif ($dim === 'day_of_week') {
+                $dowExpr = 'WEEKDAY(s.summary_date)';
+                $selectParts[] = "CAST({$dowExpr} AS CHAR) AS dim{$i}_key";
+                $selectParts[] = "NULL AS dim{$i}_label";
+                $groupParts[] = $dowExpr;
+            } elseif ($dim === 'offer') {
+                $selectParts[] = "COALESCE(CAST(s.offer_id AS CHAR), 'N/A') AS dim{$i}_key";
+                $selectParts[] = "o.name AS dim{$i}_label";
+                $groupParts[] = 's.offer_id';
+                $groupParts[] = 'o.name';
+            } else { // landing
+                $selectParts[] = "COALESCE(CAST(s.landing_page_id AS CHAR), 'N/A') AS dim{$i}_key";
+                $selectParts[] = "lp.name AS dim{$i}_label";
+                $groupParts[] = 's.landing_page_id';
+                $groupParts[] = 'lp.name';
+            }
+        }
+
+        $sql = '
+            SELECT ' . implode(",\n                       ", $selectParts) . ",
+                       SUM(s.clicks) AS clicks,
+                       SUM(s.lp_clicks) AS lp_clicks,
+                       SUM(s.direct_clicks) AS direct_clicks,
+                       SUM(s.conversions) AS conversions,
+                       {$optinsSel}
+                       {$botClicksSel}
+                       SUM(s.cost) AS cost,
+                       SUM(s.revenue) AS revenue
+            FROM clicks_daily_summary s
+            {$joins}
+            WHERE {$where}
+            GROUP BY " . implode(', ', $groupParts);
+
+        $stmt = $this->db->prepare($sql);
+        if ($stmt === false) {
+            return null;
+        }
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $result = $stmt->get_result();
+
+        $rows = [];
+        while ($row = $result->fetch_assoc()) {
+            $dimValues = [];
+            $nameParts = [];
+            $keyParts = [];
+            foreach ($dimensions as $i => $dim) {
+                $key = (string)($row["dim{$i}_key"] ?? 'N/A');
+                $label = $row["dim{$i}_label"] ?? null;
+                if ($dim === 'day_of_week' && ctype_digit($key)) {
+                    $label = CampaignStatsExpressions::formatDayOfWeekLabel((int)$key);
+                }
+                $display = ($label !== null && $label !== '') ? (string)$label : $key;
+                $dimValues[] = [
+                    'dimension' => $dim,
+                    'key' => $key,
+                    'name' => $display,
+                ];
+                $keyParts[] = $key;
+                $nameParts[] = $display;
+            }
+            $compositeKey = implode("\x1f", $keyParts);
+            $formatted = CampaignStatsExpressions::formatMetricsRow(
+                $compositeKey,
+                implode(' › ', $nameParts),
+                $row
+            );
+            $formatted['group_key'] = $formatted['group'];
+            $formatted['name'] = $formatted['group_label'] ?? implode(' › ', $nameParts);
+            $direct = (int)($row['direct_clicks'] ?? 0);
+            $formatted['direct_clicks'] = $direct;
+            $formatted['action_clicks'] = (int)($row['lp_clicks'] ?? 0) + $direct;
+            $formatted['dim_values'] = $dimValues;
             $rows[] = $formatted;
         }
         $stmt->close();

@@ -78,15 +78,7 @@
     font-weight: 600;
 }
 
-/* Visitor log row states (desktop table + mobile cards) */
-.visitor-row--clicked {
-    background-color: #e3f2fd;
-}
-
-.visitor-row--converted {
-    background-color: var(--accent-soft);
-}
-
+/* Mobile card status accents (desktop spreadsheet uses conversion-log.css inset bars) */
 .mobile-visitor-card.visitor-row {
     background: var(--color-white);
     margin-bottom: var(--spacing-md);

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace SimpleKuma\Tracking;
 
 use mysqli;
+use SimpleKuma\Database\SchemaProbe;
 
 /**
  * On-write Deep Funnel path logging + step/path daily pre-agg.
@@ -27,9 +28,8 @@ final class FunnelPathTracker
             return $this->tablesReady;
         }
         $this->tablesChecked = true;
-        $r1 = $this->db->query("SHOW TABLES LIKE 'clicks_funnel_step_daily'");
-        $r2 = $this->db->query("SHOW TABLES LIKE 'clicks_funnel_path_daily'");
-        $this->tablesReady = ($r1 && $r1->num_rows > 0 && $r2 && $r2->num_rows > 0);
+        $this->tablesReady = SchemaProbe::tableExists($this->db, 'clicks_funnel_step_daily')
+            && SchemaProbe::tableExists($this->db, 'clicks_funnel_path_daily');
         return $this->tablesReady;
     }
 

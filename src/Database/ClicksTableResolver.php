@@ -15,6 +15,18 @@ class ClicksTableResolver
 
     private static ?bool $archiveExists = null;
 
+    private static ?bool $archiveHasRows = null;
+
+    /**
+     * Drop request-local resolver decisions (called from SchemaProbe::flush).
+     */
+    public static function resetCache(): void
+    {
+        self::$statsTable = null;
+        self::$archiveExists = null;
+        self::$archiveHasRows = null;
+    }
+
     /**
      * Table or view for aggregate stats queries (includes archived clicks when unified view is current).
      *
@@ -46,17 +58,14 @@ class ClicksTableResolver
      */
     public static function archiveHasRows(mysqli $db): bool
     {
-        static $cached = null;
-        if ($cached !== null) {
-            return $cached;
+        if (self::$archiveHasRows !== null) {
+            return self::$archiveHasRows;
         }
         if (!self::archiveTableExists($db)) {
-            $cached = false;
-            return false;
+            return self::$archiveHasRows = false;
         }
         $result = $db->query('SELECT 1 FROM clicks_archive LIMIT 1');
-        $cached = $result !== false && $result->num_rows > 0;
-        return $cached;
+        return self::$archiveHasRows = ($result !== false && $result->num_rows > 0);
     }
 
     /**
@@ -75,16 +84,8 @@ class ClicksTableResolver
 
     public static function viewExists(mysqli $db): bool
     {
-        $dbName = $db->query('SELECT DATABASE()')->fetch_row()[0] ?? '';
-        $stmt = $db->prepare(
-            "SELECT 1 FROM information_schema.VIEWS
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'clicks_unified' LIMIT 1"
-        );
-        $stmt->bind_param('s', $dbName);
-        $stmt->execute();
-        $exists = (bool) $stmt->get_result()->fetch_row();
-        $stmt->close();
-        return $exists;
+        // SHOW TABLES includes views; SchemaProbe caches across requests via APCu/file.
+        return SchemaProbe::tableExists($db, 'clicks_unified');
     }
 
     public static function archiveTableExists(mysqli $db): bool
@@ -92,22 +93,11 @@ class ClicksTableResolver
         if (self::$archiveExists !== null) {
             return self::$archiveExists;
         }
-        $result = $db->query("SHOW TABLES LIKE 'clicks_archive'");
-        self::$archiveExists = $result && $result->num_rows > 0;
-        return self::$archiveExists;
+        return self::$archiveExists = SchemaProbe::tableExists($db, 'clicks_archive');
     }
 
     private static function viewHasColumn(mysqli $db, string $column): bool
     {
-        $dbName = $db->query('SELECT DATABASE()')->fetch_row()[0] ?? '';
-        $stmt = $db->prepare(
-            "SELECT 1 FROM information_schema.COLUMNS
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'clicks_unified' AND COLUMN_NAME = ? LIMIT 1"
-        );
-        $stmt->bind_param('ss', $dbName, $column);
-        $stmt->execute();
-        $exists = (bool) $stmt->get_result()->fetch_row();
-        $stmt->close();
-        return $exists;
+        return SchemaProbe::columnExists($db, 'clicks_unified', $column);
     }
 }

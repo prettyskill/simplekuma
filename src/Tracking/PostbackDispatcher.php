@@ -1055,10 +1055,7 @@ class PostbackDispatcher
         ?string $requestBody = null
     ): void {
         try {
-            // Check if table exists first
-            $tableCheck = $this->db->query("SHOW TABLES LIKE 'postback_logs'");
-            if (!$tableCheck || $tableCheck->num_rows === 0) {
-                // Table doesn't exist yet, skip database logging
+            if (!SchemaProbe::tableExists($this->db, 'postback_logs')) {
                 error_log("Postback logging skipped: postback_logs table does not exist");
                 return;
             }

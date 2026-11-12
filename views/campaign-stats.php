@@ -189,6 +189,13 @@ $statsJsVer = file_exists($statsJsPath) ? (string)filemtime($statsJsPath) : '1';
                 </div>
                 <div class="stats-v2-breakdown-run">
                     <label class="stats-v2-checkbox"><input type="checkbox" id="stats-v2-show-totals" checked> Show totals</label>
+                    <label class="stats-v2-layout-label" for="stats-v2-layout" title="Nested expands one dimension at a time; Flat shows all selected dimensions as columns">
+                        Layout
+                        <select id="stats-v2-layout" aria-label="Breakdown layout">
+                            <option value="nested">Nested</option>
+                            <option value="flat">Flat table</option>
+                        </select>
+                    </label>
                     <select id="stats-v2-density">
                         <option value="comfortable">Comfortable</option>
                         <option value="compact">Compact</option>

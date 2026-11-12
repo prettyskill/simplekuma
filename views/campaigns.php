@@ -29,6 +29,8 @@ use SimpleKuma\Auth\Auth;
 use SimpleKuma\Auth\Csrf;
 use SimpleKuma\Auth\Permission;
 use SimpleKuma\Release\TrafficSourceReleaseHelper;
+use SimpleKuma\Stats\CampaignListStatsService;
+use SimpleKuma\Tracking\ClickPath;
 
 // Check if user has no roles (fallback for legacy installations outside production only)
 $hasNoRoles = empty($_SESSION['role_ids'] ?? []) && Auth::allowsLegacyNoRolesFallback();
@@ -1048,8 +1050,26 @@ if ($editCampaign && isset($editCampaign['id'])) {
                     <a href="?page=campaign-create" class="campaign-filter-create campaign-filter-create-mobile">+ Create Campaign</a>
                     <?php endif; ?>
 
-                    <form method="get" action="" id="campaign-list-date-filter-form" class="campaign-filter-form">
+                        <form method="get" action="" id="campaign-list-date-filter-form" class="campaign-filter-form">
                         <input type="hidden" name="page" value="<?= htmlspecialchars($listPageSlug) ?>">
+                        <?php
+                        // Preserve list sort / page-size across date/status Apply (reset to page 1).
+                        $preserveSort = (string)($_GET['campaigns_sort'] ?? '');
+                        $preserveDir = (string)($_GET['campaigns_dir'] ?? '');
+                        $preservePerPage = (string)($_GET['campaigns_per_page'] ?? '');
+                        $preserveSearchQ = trim((string)($_GET['campaigns_q'] ?? ''));
+                        if ($preserveSort !== ''): ?>
+                        <input type="hidden" name="campaigns_sort" value="<?= htmlspecialchars($preserveSort) ?>">
+                        <?php endif;
+                        if ($preserveDir !== ''): ?>
+                        <input type="hidden" name="campaigns_dir" value="<?= htmlspecialchars($preserveDir) ?>">
+                        <?php endif;
+                        if ($preservePerPage !== ''): ?>
+                        <input type="hidden" name="campaigns_per_page" value="<?= htmlspecialchars($preservePerPage) ?>">
+                        <?php endif;
+                        if ($preserveSearchQ !== ''): ?>
+                        <input type="hidden" name="campaigns_q" value="<?= htmlspecialchars($preserveSearchQ) ?>">
+                        <?php endif; ?>
 
                         <div class="campaign-filter-section campaign-filter-section--presets">
                             <div class="campaign-filter-label campaign-filter-label--mobile">Date Presets</div>
@@ -1208,7 +1228,29 @@ if ($editCampaign && isset($editCampaign['id'])) {
             }
 
             $campaignsListPage = max(1, (int)($_GET['campaigns_page'] ?? 1));
-            $campaignsPerPage = 25;
+            $perPageRaw = strtolower(trim((string)($_GET['campaigns_per_page'] ?? '25')));
+            $campaignsShowAll = ($perPageRaw === 'all' || $perPageRaw === '0');
+            $campaignsPerPage = $campaignsShowAll ? PHP_INT_MAX : (int)$perPageRaw;
+            if (!$campaignsShowAll && !in_array($campaignsPerPage, [25, 50], true)) {
+                $campaignsPerPage = 25;
+                $perPageRaw = '25';
+            } elseif ($campaignsShowAll) {
+                $perPageRaw = 'all';
+            }
+
+            $metricSortKeys = ['views', 'clicks', 'conv', 'cost', 'revenue', 'profit', 'roi'];
+            $stringSortKeys = ['name', 'traffic_source', 'flow_type', 'status'];
+            $allowedSortKeys = array_merge($stringSortKeys, $metricSortKeys);
+            $campaignsSortKey = (string)($_GET['campaigns_sort'] ?? '');
+            if (!in_array($campaignsSortKey, $allowedSortKeys, true)) {
+                $campaignsSortKey = '';
+            }
+            $campaignsSortDir = strtolower((string)($_GET['campaigns_dir'] ?? ''));
+            if ($campaignsSortDir !== 'asc' && $campaignsSortDir !== 'desc') {
+                $campaignsSortDir = $campaignsSortKey !== '' && in_array($campaignsSortKey, $metricSortKeys, true)
+                    ? 'desc'
+                    : 'asc';
+            }
 
             $allCampaigns = $campaign->getAll();
             if ($allowedStatuses !== null) {
@@ -1220,15 +1262,34 @@ if ($editCampaign && isset($editCampaign['id'])) {
                 ));
             }
 
-            $campaignStatsTotal = count($allCampaigns);
-            $campaignsTotalPages = max(1, (int)ceil($campaignStatsTotal / max(1, $campaignsPerPage)));
-            if ($campaignsListPage > $campaignsTotalPages) {
-                $campaignsListPage = $campaignsTotalPages;
+            // Global search across the full filtered set (before sort + pagination).
+            $campaignsSearchQ = trim((string)($_GET['campaigns_q'] ?? ''));
+            if (strlen($campaignsSearchQ) > 200) {
+                $campaignsSearchQ = substr($campaignsSearchQ, 0, 200);
             }
-            $pageOffset = ($campaignsListPage - 1) * $campaignsPerPage;
-            $pageCampaigns = array_slice($allCampaigns, $pageOffset, $campaignsPerPage);
+            if ($campaignsSearchQ !== '') {
+                $qLower = strtolower($campaignsSearchQ);
+                $allCampaigns = array_values(array_filter(
+                    $allCampaigns,
+                    static function (array $camp) use ($qLower): bool {
+                        $trafficLabel = (empty($camp['traffic_source_id']) || empty($camp['traffic_source_name']))
+                            ? 'Auto Detected'
+                            : (string)$camp['traffic_source_name'];
+                        $hay = strtolower(
+                            ($camp['name'] ?? '') . ' ' .
+                            ($camp['tags'] ?? '') . ' #' .
+                            ($camp['id'] ?? '') . ' ' .
+                            $trafficLabel . ' ' .
+                            ($camp['campaign_group_name'] ?? '') . ' ' .
+                            ($camp['flow_type'] ?? '') . ' ' .
+                            ($camp['status'] ?? '') . ' ' .
+                            ($camp['campaign_key'] ?? '')
+                        );
+                        return strpos($hay, $qLower) !== false;
+                    }
+                ));
+            }
 
-            // Empty stats shell — filled asynchronously via api-campaign-list-stats.php
             $emptyStats = [
                 'views' => 0,
                 'lp_clicks' => 0,
@@ -1239,20 +1300,106 @@ if ($editCampaign && isset($editCampaign['id'])) {
                 'profit' => 0,
                 'roi' => 0,
             ];
-            foreach ($pageCampaigns as &$camp) {
-                $camp['stats'] = $emptyStats;
-                $camp['slugs'] = [];
+
+            // Global metric sort needs stats for the full filtered set before pagination.
+            $statsPreloaded = false;
+            if ($campaignsSortKey !== '' && in_array($campaignsSortKey, $metricSortKeys, true) && $allCampaigns !== []) {
+                $sortIds = array_map(static fn (array $c): int => (int)$c['id'], $allCampaigns);
+                $statsMap = (new CampaignListStatsService($db))->loadStatsForCampaignIds(
+                    $sortIds,
+                    $dateFrom,
+                    $dateTo,
+                    $userTimezone
+                );
+                foreach ($allCampaigns as &$camp) {
+                    $cid = (int)$camp['id'];
+                    $camp['stats'] = $statsMap[$cid] ?? $emptyStats;
+                    $camp['slugs'] = [];
+                }
+                unset($camp);
+                $statsPreloaded = true;
+            } else {
+                foreach ($allCampaigns as &$camp) {
+                    $camp['stats'] = $emptyStats;
+                    $camp['slugs'] = [];
+                }
+                unset($camp);
             }
-            unset($camp);
+
+            $campaignListSortValue = static function (array $camp, string $key) {
+                $stats = $camp['stats'] ?? [];
+                switch ($key) {
+                    case 'name':
+                        return strtolower((string)($camp['name'] ?? ''));
+                    case 'traffic_source':
+                        if (empty($camp['traffic_source_id']) || empty($camp['traffic_source_name'])) {
+                            return 'auto detected';
+                        }
+                        return strtolower((string)$camp['traffic_source_name']);
+                    case 'flow_type':
+                        return strtolower((string)($camp['flow_type'] ?? ''));
+                    case 'status':
+                        return strtolower((string)($camp['status'] ?? ''));
+                    case 'views':
+                        return (float)($stats['views'] ?? 0);
+                    case 'clicks':
+                        return (float)(($stats['lp_clicks'] ?? 0) + ($stats['direct_clicks'] ?? 0));
+                    case 'conv':
+                        return (float)($stats['conversions'] ?? 0);
+                    case 'cost':
+                        return (float)($stats['cost'] ?? 0);
+                    case 'revenue':
+                        return (float)($stats['revenue'] ?? 0);
+                    case 'profit':
+                        return (float)($stats['profit'] ?? 0);
+                    case 'roi':
+                        return (float)($stats['roi'] ?? 0);
+                    default:
+                        return 0.0;
+                }
+            };
+
+            if ($campaignsSortKey !== '') {
+                $sortKey = $campaignsSortKey;
+                $sortDir = $campaignsSortDir;
+                $isStringSort = in_array($sortKey, $stringSortKeys, true);
+                usort($allCampaigns, static function (array $a, array $b) use ($campaignListSortValue, $sortKey, $sortDir, $isStringSort): int {
+                    $va = $campaignListSortValue($a, $sortKey);
+                    $vb = $campaignListSortValue($b, $sortKey);
+                    if ($isStringSort) {
+                        $cmp = strnatcasecmp((string)$va, (string)$vb);
+                    } else {
+                        $cmp = $va <=> $vb;
+                    }
+                    if ($cmp === 0) {
+                        return ((int)($a['id'] ?? 0)) <=> ((int)($b['id'] ?? 0));
+                    }
+                    return $sortDir === 'asc' ? $cmp : -$cmp;
+                });
+            }
+
+            $campaignStatsTotal = count($allCampaigns);
+            $campaignsTotalPages = $campaignsShowAll
+                ? 1
+                : max(1, (int)ceil($campaignStatsTotal / max(1, $campaignsPerPage)));
+            if ($campaignsListPage > $campaignsTotalPages) {
+                $campaignsListPage = $campaignsTotalPages;
+            }
+            $pageOffset = $campaignsShowAll ? 0 : (($campaignsListPage - 1) * $campaignsPerPage);
+            $pageCampaigns = $campaignsShowAll
+                ? $allCampaigns
+                : array_slice($allCampaigns, $pageOffset, $campaignsPerPage);
+
+            // Async fill only when we did not already load metrics for a global metric sort.
+            if (!$statsPreloaded) {
+                foreach ($pageCampaigns as &$camp) {
+                    $camp['stats'] = $emptyStats;
+                    $camp['slugs'] = [];
+                }
+                unset($camp);
+            }
 
             $pageCampaignIds = array_map(static fn (array $c): int => (int)$c['id'], $pageCampaigns);
-
-            $statusQueryForApi = '';
-            if ($allowedStatuses !== null) {
-                foreach ($allowedStatuses as $st) {
-                    $statusQueryForApi .= '&status_filter[]=' . rawurlencode($st);
-                }
-            }
             $campaignListStatsApiUrl = rtrim(APP_BASE_URL, '/') . '/api-campaign-list-stats.php'
                 . '?date_from=' . rawurlencode($dateFrom)
                 . '&date_to=' . rawurlencode($dateTo)
@@ -1274,6 +1421,7 @@ if ($editCampaign && isset($editCampaign['id'])) {
 
             // Keep $allCampaigns as page slice for empty check / render
             $allCampaigns = $pageCampaigns;
+            $GLOBALS['campaignListStatsPreloaded'] = $statsPreloaded;
 
             $listStatusQuery = '';
             if ($allowedStatuses !== null) {
@@ -1281,16 +1429,39 @@ if ($editCampaign && isset($editCampaign['id'])) {
                     $listStatusQuery .= '&status_filter[]=' . urlencode($st);
                 }
             }
+            $listSortQuery = '';
+            if ($campaignsSortKey !== '') {
+                $listSortQuery .= '&campaigns_sort=' . urlencode($campaignsSortKey)
+                    . '&campaigns_dir=' . urlencode($campaignsSortDir);
+            }
+            $listPerPageQuery = '&campaigns_per_page=' . urlencode($perPageRaw);
+            $listSearchQuery = $campaignsSearchQ !== ''
+                ? '&campaigns_q=' . urlencode($campaignsSearchQ)
+                : '';
             $listBaseQs = 'page=' . urlencode($listPageSlug)
                 . '&date_from=' . urlencode($dateFrom)
                 . '&date_to=' . urlencode($dateTo)
-                . $listStatusQuery;
+                . $listStatusQuery
+                . $listSortQuery
+                . $listPerPageQuery
+                . $listSearchQuery;
+            $listBaseQsNoSearch = 'page=' . urlencode($listPageSlug)
+                . '&date_from=' . urlencode($dateFrom)
+                . '&date_to=' . urlencode($dateTo)
+                . $listStatusQuery
+                . $listSortQuery
+                . $listPerPageQuery;
             ?>
 
             <?php if ($campaignStatsTotal === 0): ?>
                 <div style="text-align: center; padding: 60px; color: #999;">
                     <img src="<?= ASSETS_BASE_URL ?>/assets/images/campaigns.png" alt="Campaigns" style="width: 64px; height: 64px; margin-bottom: 16px;">
-                    <?php if ($allowedStatuses !== null): ?>
+                    <?php if ($campaignsSearchQ !== ''): ?>
+                    <p>No campaigns match “<?= htmlspecialchars($campaignsSearchQ) ?>”.</p>
+                    <p style="font-size: 13px; margin-top: 8px;">
+                        <a href="?<?= htmlspecialchars($listBaseQsNoSearch) ?>" class="btn btn-outline" style="padding:6px 12px; font-size:13px;">Clear search</a>
+                    </p>
+                    <?php elseif ($allowedStatuses !== null): ?>
                     <p>No campaigns match the selected status filters.</p>
                     <p style="font-size: 13px; margin-top: 8px;">Try enabling Active, Paused, or Archived above.</p>
                     <?php else: ?>
@@ -1300,30 +1471,81 @@ if ($editCampaign && isset($editCampaign['id'])) {
                     <?php endif; ?>
                     <?php endif; ?>
                 </div>
+                <?php if ($campaignsSearchQ !== ''): ?>
+                <!-- Keep search bar visible on empty results -->
+                <div style="margin: 0 auto 24px; max-width: 450px; padding: 0 16px;">
+                    <input type="text" id="campaignSearchInput" value="<?= htmlspecialchars($campaignsSearchQ) ?>"
+                           placeholder="🔍 Search campaigns by name, tag, #ID, source, key…"
+                           class="campaign-search-input"
+                           style="width: 100%; padding: 9px 14px; border: 2px solid #ddd; border-radius: 6px; font-size: 13px; background: #fff;">
+                </div>
+                <script>
+                    (function initCampaignListSearchEmpty() {
+                        var input = document.getElementById('campaignSearchInput');
+                        if (!input) return;
+                        var timer = null;
+                        function go() {
+                            var q = (input.value || '').trim();
+                            var url = new URL(window.location.href);
+                            url.searchParams.set('campaigns_page', '1');
+                            if (q) { url.searchParams.set('campaigns_q', q); }
+                            else { url.searchParams.delete('campaigns_q'); }
+                            window.location = url.toString();
+                        }
+                        input.addEventListener('input', function () {
+                            clearTimeout(timer);
+                            timer = setTimeout(go, 400);
+                        });
+                        input.addEventListener('keydown', function (e) {
+                            if (e.key === 'Enter') {
+                                e.preventDefault();
+                                clearTimeout(timer);
+                                go();
+                            }
+                        });
+                    })();
+                </script>
+                <?php endif; ?>
             <?php else: ?>
-                <?php if ($campaignsTotalPages > 1): ?>
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; font-size:13px; color:#666;">
-                    <span>Showing <?= count($allCampaigns) ?> of <?= (int)$campaignStatsTotal ?> campaigns (page <?= (int)$campaignsListPage ?>/<?= (int)$campaignsTotalPages ?>)</span>
-                    <span style="display:flex; gap:8px;">
-                        <?php if ($campaignsListPage > 1): ?>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; font-size:13px; color:#666; flex-wrap:wrap; gap:8px;">
+                    <span>Showing <?= count($allCampaigns) ?> of <?= (int)$campaignStatsTotal ?> campaigns<?= $campaignsShowAll ? '' : ' (page ' . (int)$campaignsListPage . '/' . (int)$campaignsTotalPages . ')' ?><?= $campaignsSearchQ !== '' ? ' matching “' . htmlspecialchars($campaignsSearchQ) . '”' : '' ?></span>
+                    <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                        <label style="display:inline-flex; align-items:center; gap:6px; font-size:12px;">
+                            Show
+                            <select id="campaignsPerPageSelect" style="padding:3px 6px; font-size:12px; border:1px solid #ddd; border-radius:4px; background:#fff;"
+                                    onchange="(function(sel){ var u=new URL(window.location.href); u.searchParams.set('campaigns_per_page', sel.value); u.searchParams.set('campaigns_page','1'); window.location=u.toString(); })(this)">
+                                <option value="25"<?= $perPageRaw === '25' ? ' selected' : '' ?>>25</option>
+                                <option value="50"<?= $perPageRaw === '50' ? ' selected' : '' ?>>50</option>
+                                <option value="all"<?= $perPageRaw === 'all' ? ' selected' : '' ?>>All</option>
+                            </select>
+                        </label>
+                        <?php if (!$campaignsShowAll && $campaignsListPage > 1): ?>
                             <a class="btn btn-outline" style="padding:4px 10px; font-size:12px;" href="?<?= $listBaseQs ?>&campaigns_page=<?= $campaignsListPage - 1 ?>">Previous</a>
                         <?php endif; ?>
-                        <?php if ($campaignsListPage < $campaignsTotalPages): ?>
+                        <?php if (!$campaignsShowAll && $campaignsListPage < $campaignsTotalPages): ?>
                             <a class="btn btn-outline" style="padding:4px 10px; font-size:12px;" href="?<?= $listBaseQs ?>&campaigns_page=<?= $campaignsListPage + 1 ?>">Next</a>
                         <?php endif; ?>
                     </span>
                 </div>
-                <?php endif; ?>
+                <?php if ($statsPreloaded): ?>
+                <div id="campaign-list-stats-status" style="display:none;"></div>
+                <?php else: ?>
                 <div id="campaign-list-stats-status" style="font-size:12px; color:#888; margin-bottom:8px;">Loading performance stats…</div>
-                <!-- Search and Filter Bar -->
+                <?php endif; ?>
+                <!-- Search and Filter Bar (server-side across all campaigns) -->
                 <div style="margin-bottom: 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                     <div style="position: relative; flex: 1; min-width: 260px; max-width: 450px;">
-                        <input type="text" id="campaignSearchInput" placeholder="🔍 Search campaigns by name, tag, #ID, source..." 
-                               oninput="filterCampaignsTable()"
+                        <input type="text" id="campaignSearchInput" value="<?= htmlspecialchars($campaignsSearchQ) ?>"
+                               placeholder="🔍 Search campaigns by name, tag, #ID, source, key…"
                                class="campaign-search-input"
                                style="width: 100%; padding: 9px 14px; border: 2px solid #ddd; border-radius: 6px; font-size: 13px; background: #fff;">
                     </div>
-                    <span id="campaignSearchCount" style="font-size: 13px; color: #666; font-weight: 500;"></span>
+                    <span id="campaignSearchCount" style="font-size: 13px; color: #666; font-weight: 500;">
+                        <?= (int)$campaignStatsTotal ?> match<?= $campaignStatsTotal === 1 ? '' : 'es' ?>
+                    </span>
+                    <?php if ($campaignsSearchQ !== ''): ?>
+                    <a href="?<?= htmlspecialchars($listBaseQsNoSearch) ?>" style="font-size:12px; color:#666;">Clear</a>
+                    <?php endif; ?>
                 </div>
                 <!-- Desktop Table View (hidden on mobile) -->
                 <div class="table-wrapper desktop-only" data-campaign-list-stats-url="<?= htmlspecialchars($campaignListStatsApiUrl) ?>">
@@ -1335,6 +1557,23 @@ if ($editCampaign && isset($editCampaign['id'])) {
                         $permission = $GLOBALS['permission'] ?? null;
                         
                         $stats = $camp['stats'] ?? [];
+                        $rowViews = (int)($stats['views'] ?? 0);
+                        $rowClicks = (int)(($stats['lp_clicks'] ?? 0) + ($stats['direct_clicks'] ?? 0));
+                        $rowConv = (int)($stats['conversions'] ?? 0);
+                        $rowCost = (float)($stats['cost'] ?? 0);
+                        $rowRevenue = (float)($stats['revenue'] ?? 0);
+                        $rowProfit = (float)($stats['profit'] ?? (($rowRevenue - $rowCost)));
+                        $rowRoi = (float)($stats['roi'] ?? 0);
+                        $statsReady = !empty($GLOBALS['campaignListStatsPreloaded']);
+                        $fmtMoney = static function (float $n): string {
+                            return '$' . number_format($n, 2);
+                        };
+                        $fmtRoi = static function (float $n): string {
+                            if ($n >= 99999) {
+                                return '∞';
+                            }
+                            return number_format($n, 1) . '%';
+                        };
                         $trafficLabel = (empty($camp['traffic_source_id']) || empty($camp['traffic_source_name']))
                             ? 'Auto Detected'
                             : (string)$camp['traffic_source_name'];
@@ -1345,8 +1584,17 @@ if ($editCampaign && isset($editCampaign['id'])) {
                             $trafficLabel . ' ' .
                             ($camp['campaign_group_name'] ?? '') . ' ' .
                             ($camp['flow_type'] ?? '') . ' ' .
-                            ($camp['status'] ?? '')
+                            ($camp['status'] ?? '') . ' ' .
+                            ($camp['campaign_key'] ?? '')
                         );
+                        $campKey = trim((string)($camp['campaign_key'] ?? ''));
+                        $listTrackingUrl = $campKey !== ''
+                            ? ClickPath::url(Formatter::getCampaignBaseUrl($camp), $campKey)
+                            : '';
+                        $isWhopSource = stripos($trafficLabel, 'whop') !== false;
+                        $copyLinkTitle = $isWhopSource
+                            ? 'Copy tracking link (Whop Ads: use your LP URL in Whop, not this link)'
+                            : 'Copy tracking link';
                         $rowStyle = $groupId !== null ? 'display: none;' : '';
                         ?>
                         <tr class="campaign-row"
@@ -1357,12 +1605,13 @@ if ($editCampaign && isset($editCampaign['id'])) {
                             data-sort-traffic_source="<?= htmlspecialchars($trafficLabel, ENT_QUOTES) ?>"
                             data-sort-flow_type="<?= htmlspecialchars((string)$camp['flow_type'], ENT_QUOTES) ?>"
                             data-sort-status="<?= htmlspecialchars((string)$camp['status'], ENT_QUOTES) ?>"
-                            data-sort-views="<?= (int)($stats['views'] ?? 0) ?>"
-                            data-sort-clicks="<?= (int)(($stats['lp_clicks'] ?? 0) + ($stats['direct_clicks'] ?? 0)) ?>"
-                            data-sort-conv="<?= (int)($stats['conversions'] ?? 0) ?>"
-                            data-sort-cost="<?= (float)($stats['cost'] ?? 0) ?>"
-                            data-sort-revenue="<?= (float)($stats['revenue'] ?? 0) ?>"
-                            data-sort-roi="<?= (float)($stats['roi'] ?? 0) ?>"
+                            data-sort-views="<?= $rowViews ?>"
+                            data-sort-clicks="<?= $rowClicks ?>"
+                            data-sort-conv="<?= $rowConv ?>"
+                            data-sort-cost="<?= $rowCost ?>"
+                            data-sort-revenue="<?= $rowRevenue ?>"
+                            data-sort-profit="<?= $rowProfit ?>"
+                            data-sort-roi="<?= $rowRoi ?>"
                             style="<?= $rowStyle ?>">
                             <td class="col-name" style="<?= $indent ? 'padding-left: 40px;' : '' ?>">
                                 <span class="badge" style="background: #eef2f5; color: #475569; font-weight: 600; font-size: 11px; padding: 2px 6px; border-radius: 4px; margin-right: 6px;" title="Campaign ID: <?= (int)$camp['id'] ?>">#<?= (int)$camp['id'] ?></span>
@@ -1400,12 +1649,13 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                     <span class="badge" style="font-size: 11px;">Archived</span>
                                 <?php endif; ?>
                             </td>
-                            <td class="cl-stat cl-stat-views col-num" style="font-size: 12px; color: #666;">—</td>
-                            <td class="cl-stat cl-stat-clicks col-num" style="font-size: 12px; color: #666;">—</td>
-                            <td class="cl-stat cl-stat-conv col-num" style="font-size: 12px; color: #666;">—</td>
-                            <td class="cl-stat cl-stat-cost col-money" style="font-size: 12px; color: #d32f2f; font-weight: 500;">—</td>
-                            <td class="cl-stat cl-stat-revenue col-money" style="font-size: 12px; color: #666;">—</td>
-                            <td class="cl-stat cl-stat-roi col-roi" style="font-size: 12px; color: #666; font-weight: 600;">—</td>
+                            <td class="cl-stat cl-stat-views col-num" style="font-size: 12px; color: #666;"><?= $statsReady ? number_format($rowViews) : '—' ?></td>
+                            <td class="cl-stat cl-stat-clicks col-num" style="font-size: 12px; color: #666;"><?= $statsReady ? number_format($rowClicks) : '—' ?></td>
+                            <td class="cl-stat cl-stat-conv col-num" style="font-size: 12px; color: #666;"><?= $statsReady ? number_format($rowConv) : '—' ?></td>
+                            <td class="cl-stat cl-stat-cost col-money" style="font-size: 12px; color: #d32f2f; font-weight: 500;"><?= $statsReady ? htmlspecialchars($fmtMoney($rowCost)) : '—' ?></td>
+                            <td class="cl-stat cl-stat-revenue col-money" style="font-size: 12px; color: <?= $statsReady && $rowRevenue > 0 ? '#28a745' : '#666' ?>; font-weight: <?= $statsReady && $rowRevenue > 0 ? '600' : '400' ?>;"><?= $statsReady ? htmlspecialchars($fmtMoney($rowRevenue)) : '—' ?></td>
+                            <td class="cl-stat cl-stat-profit col-money" style="font-size: 12px; color: <?= $statsReady ? ($rowProfit >= 0 ? '#28a745' : '#d32f2f') : '#666' ?>; font-weight: 600;"><?= $statsReady ? htmlspecialchars($fmtMoney($rowProfit)) : '—' ?></td>
+                            <td class="cl-stat cl-stat-roi col-roi" style="font-size: 12px; color: <?= $statsReady ? ($rowRoi >= 0 ? '#28a745' : '#d32f2f') : '#666' ?>; font-weight: 600;"><?= $statsReady ? htmlspecialchars($fmtRoi($rowRoi)) : '—' ?></td>
                             <td class="col-actions">
                                 <div class="campaign-actions">
                                     <!-- Stats Button -->
@@ -1415,6 +1665,17 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                        title="View Stats">
                                         📊
                                     </a>
+                                    <?php if ($listTrackingUrl !== ''): ?>
+                                    <button type="button"
+                                            class="campaign-action-btn"
+                                            data-action="copy-link"
+                                            data-tracking-url="<?= htmlspecialchars($listTrackingUrl, ENT_QUOTES) ?>"
+                                            title="<?= htmlspecialchars($copyLinkTitle, ENT_QUOTES) ?>"
+                                            aria-label="Copy tracking link"
+                                            onclick="copyCampaignListTrackingLink(this)">
+                                        🔗
+                                    </button>
+                                    <?php endif; ?>
                                     <?php if (!$permission || $permission->hasPermission(\SimpleKuma\Auth\Permission::PERM_CAMPAIGN_EDIT)): ?>
                                     <!-- Edit Button -->
                                     <a href="?page=campaigns&action=edit&id=<?= $camp['id'] ?>" 
@@ -1646,7 +1907,10 @@ if ($editCampaign && isset($editCampaign['id'])) {
                         color: #f44336;
                     }
                 </style>
-                <table class="table campaigns-table campaigns-table-sortable" data-sort-key="" data-sort-dir="asc">
+                <table class="table campaigns-table campaigns-table-sortable"
+                       data-sort-key="<?= htmlspecialchars($campaignsSortKey, ENT_QUOTES) ?>"
+                       data-sort-dir="<?= htmlspecialchars($campaignsSortDir, ENT_QUOTES) ?>"
+                       data-global-sort="1">
                     <colgroup>
                         <col class="col-name">
                         <col class="col-source">
@@ -1657,21 +1921,31 @@ if ($editCampaign && isset($editCampaign['id'])) {
                         <col class="col-num">
                         <col class="col-money">
                         <col class="col-money">
+                        <col class="col-money">
                         <col class="col-roi">
                         <col class="col-actions">
                     </colgroup>
                     <thead>
                         <tr>
-                            <th class="sortable-col col-name" data-sort-key="name" data-sort-type="string" title="Click to sort">Name <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                            <th class="sortable-col col-source" data-sort-key="traffic_source" data-sort-type="string" title="Click to sort">Source <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                            <th class="sortable-col col-flow" data-sort-key="flow_type" data-sort-type="string" title="Click to sort">Flow <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                            <th class="sortable-col col-status" data-sort-key="status" data-sort-type="string" title="Click to sort">Status <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                            <th class="sortable-col col-num" data-sort-key="views" data-sort-type="number" title="Click to sort">Views <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                            <th class="sortable-col col-num" data-sort-key="clicks" data-sort-type="number" title="Click to sort">Clicks <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                            <th class="sortable-col col-num" data-sort-key="conv" data-sort-type="number" title="Click to sort">Conv <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                            <th class="sortable-col col-money" data-sort-key="cost" data-sort-type="number" title="Click to sort">Cost <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                            <th class="sortable-col col-money" data-sort-key="revenue" data-sort-type="number" title="Click to sort">Revenue <span class="sort-indicator" aria-hidden="true">↕</span></th>
-                            <th class="sortable-col col-roi" data-sort-key="roi" data-sort-type="number" title="Click to sort">ROI <span class="sort-indicator" aria-hidden="true">↕</span></th>
+                            <?php
+                            $sortIndicator = static function (string $key) use ($campaignsSortKey, $campaignsSortDir): string {
+                                if ($campaignsSortKey !== $key) {
+                                    return '↕';
+                                }
+                                return $campaignsSortDir === 'asc' ? '↑' : '↓';
+                            };
+                            ?>
+                            <th class="sortable-col col-name" data-sort-key="name" data-sort-type="string" title="Sort all campaigns by name">Name <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('name') ?></span></th>
+                            <th class="sortable-col col-source" data-sort-key="traffic_source" data-sort-type="string" title="Sort all campaigns by source">Source <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('traffic_source') ?></span></th>
+                            <th class="sortable-col col-flow" data-sort-key="flow_type" data-sort-type="string" title="Sort all campaigns by flow">Flow <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('flow_type') ?></span></th>
+                            <th class="sortable-col col-status" data-sort-key="status" data-sort-type="string" title="Sort all campaigns by status">Status <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('status') ?></span></th>
+                            <th class="sortable-col col-num" data-sort-key="views" data-sort-type="number" title="Sort all campaigns by views">Views <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('views') ?></span></th>
+                            <th class="sortable-col col-num" data-sort-key="clicks" data-sort-type="number" title="Sort all campaigns by clicks">Clicks <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('clicks') ?></span></th>
+                            <th class="sortable-col col-num" data-sort-key="conv" data-sort-type="number" title="Sort all campaigns by conversions">Conv <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('conv') ?></span></th>
+                            <th class="sortable-col col-money" data-sort-key="cost" data-sort-type="number" title="Sort all campaigns by cost">Cost <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('cost') ?></span></th>
+                            <th class="sortable-col col-money" data-sort-key="revenue" data-sort-type="number" title="Sort all campaigns by revenue">Revenue <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('revenue') ?></span></th>
+                            <th class="sortable-col col-money" data-sort-key="profit" data-sort-type="number" title="Sort all campaigns by profit">Profit <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('profit') ?></span></th>
+                            <th class="sortable-col col-roi" data-sort-key="roi" data-sort-type="number" title="Sort all campaigns by ROI">ROI <span class="sort-indicator" aria-hidden="true"><?= $sortIndicator('roi') ?></span></th>
                             <th class="col-actions">Actions</th>
                         </tr>
                     </thead>
@@ -1712,6 +1986,7 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                     data-sort-conv="0"
                                     data-sort-cost="0"
                                     data-sort-revenue="0"
+                                    data-sort-profit="0"
                                     data-sort-roi="0"
                                     onclick="toggleGroup('<?= htmlspecialchars($groupId, ENT_QUOTES) ?>')"
                                     style="cursor: pointer; background: #f9f9f9;">
@@ -1725,6 +2000,7 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                     <td class="cl-group-stat cl-stat-conv col-num" style="font-size: 12px; font-weight: 600; color: #666;">—</td>
                                     <td class="cl-group-stat cl-stat-cost col-money" style="font-size: 12px; font-weight: 600; color: #d32f2f;">—</td>
                                     <td class="cl-group-stat cl-stat-revenue col-money" style="font-size: 12px; font-weight: 600; color: #666;">—</td>
+                                    <td class="cl-group-stat cl-stat-profit col-money" style="font-size: 12px; font-weight: 600; color: #666;">—</td>
                                     <td class="cl-group-stat cl-stat-roi col-roi" style="font-size: 12px; font-weight: 600; color: #666;">—</td>
                                     <td class="col-actions"></td>
                             </tr>
@@ -1777,8 +2053,9 @@ if ($editCampaign && isset($editCampaign['id'])) {
                             <div><strong>Views:</strong> <span class="cl-group-stat cl-stat-views">—</span></div>
                             <div><strong>Clicks:</strong> <span class="cl-group-stat cl-stat-clicks">—</span></div>
                             <div><strong>Conv:</strong> <span class="cl-group-stat cl-stat-conv">—</span></div>
-                            <div><strong>Revenue:</strong> <span class="cl-group-stat cl-stat-revenue" style="color: #28a745;">—</span></div>
                             <div><strong>Cost:</strong> <span class="cl-group-stat cl-stat-cost">—</span></div>
+                            <div><strong>Revenue:</strong> <span class="cl-group-stat cl-stat-revenue" style="color: #28a745;">—</span></div>
+                            <div><strong>Profit:</strong> <span class="cl-group-stat cl-stat-profit">—</span></div>
                             <div><strong>ROI:</strong> <span class="cl-group-stat cl-stat-roi">—</span></div>
                         </div>
                         <div id="mobile-group-<?= md5($groupName) ?>" class="mobile-group-campaigns" style="display: none;">
@@ -1795,8 +2072,17 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                     $trafficLabel . ' ' .
                                     ($camp['campaign_group_name'] ?? '') . ' ' .
                                     ($camp['flow_type'] ?? '') . ' ' .
-                                    ($camp['status'] ?? '')
+                                    ($camp['status'] ?? '') . ' ' .
+                                    ($camp['campaign_key'] ?? '')
                                 );
+                                $campKey = trim((string)($camp['campaign_key'] ?? ''));
+                                $listTrackingUrl = $campKey !== ''
+                                    ? ClickPath::url(Formatter::getCampaignBaseUrl($camp), $campKey)
+                                    : '';
+                                $isWhopSource = stripos($trafficLabel, 'whop') !== false;
+                                $copyLinkTitle = $isWhopSource
+                                    ? 'Copy tracking link (Whop Ads: use your LP URL in Whop, not this link)'
+                                    : 'Copy tracking link';
                                 ?>
                                 <div class="mobile-campaign-card" data-campaign-id="<?= (int)$camp['id'] ?>" data-search="<?= htmlspecialchars($searchData, ENT_QUOTES) ?>" style="padding: var(--spacing-md); border-bottom: 1px solid var(--color-gray-200);">
                                     <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: var(--spacing-sm);">
@@ -1839,6 +2125,7 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                         <div><strong>Conv:</strong> <span class="cl-stat cl-stat-conv">—</span></div>
                                         <div><strong>Cost:</strong> <span class="cl-stat cl-stat-cost" style="color: #d32f2f;">—</span></div>
                                         <div><strong>Revenue:</strong> <span class="cl-stat cl-stat-revenue" style="color: #28a745;">—</span></div>
+                                        <div><strong>Profit:</strong> <span class="cl-stat cl-stat-profit" style="font-weight: 600;">—</span></div>
                                         <div><strong>ROI:</strong> <span class="cl-stat cl-stat-roi" style="font-weight: 600;">—</span></div>
                                     </div>
                                     
@@ -1847,6 +2134,15 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                            style="padding: 8px 14px; min-height: 44px; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; text-decoration: none; color: #666; display: inline-flex; align-items: center; justify-content: center; touch-action: manipulation; -webkit-tap-highlight-color: transparent;">
                                             📊 Stats
                                         </a>
+                                        <?php if ($listTrackingUrl !== ''): ?>
+                                        <button type="button"
+                                                data-tracking-url="<?= htmlspecialchars($listTrackingUrl, ENT_QUOTES) ?>"
+                                                title="<?= htmlspecialchars($copyLinkTitle, ENT_QUOTES) ?>"
+                                                onclick="copyCampaignListTrackingLink(this)"
+                                                style="padding: 8px 14px; min-height: 44px; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; color: #666; display: inline-flex; align-items: center; justify-content: center; touch-action: manipulation; -webkit-tap-highlight-color: transparent;">
+                                            🔗 Copy Link
+                                        </button>
+                                        <?php endif; ?>
                                         <?php if (!$permission || $permission->hasPermission(\SimpleKuma\Auth\Permission::PERM_CAMPAIGN_EDIT)): ?>
                                         <a href="?page=campaigns&action=edit&id=<?= $camp['id'] ?>" 
                                            style="padding: 8px 14px; min-height: 44px; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; text-decoration: none; color: #666; display: inline-flex; align-items: center; justify-content: center; touch-action: manipulation; -webkit-tap-highlight-color: transparent;">
@@ -1895,8 +2191,17 @@ if ($editCampaign && isset($editCampaign['id'])) {
                             $trafficLabel . ' ' .
                             ($camp['campaign_group_name'] ?? '') . ' ' .
                             ($camp['flow_type'] ?? '') . ' ' .
-                            ($camp['status'] ?? '')
+                            ($camp['status'] ?? '') . ' ' .
+                            ($camp['campaign_key'] ?? '')
                         );
+                        $campKey = trim((string)($camp['campaign_key'] ?? ''));
+                        $listTrackingUrl = $campKey !== ''
+                            ? ClickPath::url(Formatter::getCampaignBaseUrl($camp), $campKey)
+                            : '';
+                        $isWhopSource = stripos($trafficLabel, 'whop') !== false;
+                        $copyLinkTitle = $isWhopSource
+                            ? 'Copy tracking link (Whop Ads: use your LP URL in Whop, not this link)'
+                            : 'Copy tracking link';
                     ?>
                     <div class="mobile-campaign-card" data-campaign-id="<?= (int)$camp['id'] ?>" data-search="<?= htmlspecialchars($searchData, ENT_QUOTES) ?>" style="background: var(--color-white); border: 1px solid var(--color-gray-200); border-radius: var(--radius-md); padding: var(--spacing-md); margin-bottom: var(--spacing-md); box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
                         <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: var(--spacing-sm);">
@@ -1939,6 +2244,7 @@ if ($editCampaign && isset($editCampaign['id'])) {
                             <div><strong>Conv:</strong> <span class="cl-stat cl-stat-conv">—</span></div>
                             <div><strong>Cost:</strong> <span class="cl-stat cl-stat-cost" style="color: #d32f2f;">—</span></div>
                             <div><strong>Revenue:</strong> <span class="cl-stat cl-stat-revenue" style="color: #28a745;">—</span></div>
+                            <div><strong>Profit:</strong> <span class="cl-stat cl-stat-profit" style="font-weight: 600;">—</span></div>
                             <div><strong>ROI:</strong> <span class="cl-stat cl-stat-roi" style="font-weight: 600;">—</span></div>
                         </div>
                         
@@ -1947,6 +2253,15 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                style="padding: 8px 14px; min-height: 44px; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; text-decoration: none; color: #666; display: inline-flex; align-items: center; justify-content: center; touch-action: manipulation; -webkit-tap-highlight-color: transparent;">
                                 📊 Stats
                             </a>
+                            <?php if ($listTrackingUrl !== ''): ?>
+                            <button type="button"
+                                    data-tracking-url="<?= htmlspecialchars($listTrackingUrl, ENT_QUOTES) ?>"
+                                    title="<?= htmlspecialchars($copyLinkTitle, ENT_QUOTES) ?>"
+                                    onclick="copyCampaignListTrackingLink(this)"
+                                    style="padding: 8px 14px; min-height: 44px; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; color: #666; display: inline-flex; align-items: center; justify-content: center; touch-action: manipulation; -webkit-tap-highlight-color: transparent;">
+                                🔗 Copy Link
+                            </button>
+                            <?php endif; ?>
                             <?php if (!$permission || $permission->hasPermission(\SimpleKuma\Auth\Permission::PERM_CAMPAIGN_EDIT)): ?>
                             <a href="?page=campaigns&action=edit&id=<?= $camp['id'] ?>" 
                                style="padding: 8px 14px; min-height: 44px; font-size: 13px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; text-decoration: none; color: #666; display: inline-flex; align-items: center; justify-content: center; touch-action: manipulation; -webkit-tap-highlight-color: transparent;">
@@ -1993,103 +2308,59 @@ if ($editCampaign && isset($editCampaign['id'])) {
                         }
                     }
 
-                    function filterCampaignsTable() {
-                        var input = document.getElementById('campaignSearchInput');
-                        var query = (input ? input.value : '').toLowerCase().trim();
-                        var rows = document.querySelectorAll('.campaigns-table tbody tr.campaign-row');
-                        var groupHeaders = document.querySelectorAll('.campaigns-table tbody tr.group-header');
-                        var groupCards = document.querySelectorAll('.mobile-campaign-cards .mobile-group-card');
-                        var ungroupedCards = document.querySelectorAll('.mobile-campaign-cards > .mobile-campaign-card');
-
-                        var visibleCount = 0;
-                        var totalCount = rows.length || (groupCards.length + ungroupedCards.length);
-                        var matchingGroupIds = new Set();
-
-                        // 1. Desktop table rows
-                        rows.forEach(function(row) {
-                            var searchData = row.getAttribute('data-search') || '';
-                            var match = !query || searchData.indexOf(query) !== -1;
-                            var groupId = row.getAttribute('data-group-id');
-
-                            if (match) {
-                                visibleCount++;
-                                if (groupId) {
-                                    matchingGroupIds.add(groupId);
-                                }
-                            }
-
-                            if (!query) {
-                                if (groupId) {
-                                    var toggle = document.getElementById('toggle-' + groupId);
-                                    var isOpen = toggle && toggle.textContent === '▼';
-                                    row.style.display = isOpen ? '' : 'none';
-                                } else {
-                                    row.style.display = '';
-                                }
-                            } else {
-                                row.style.display = match ? '' : 'none';
-                            }
-                        });
-
-                        // 2. Desktop group header rows
-                        groupHeaders.forEach(function(hdr) {
-                            var gId = hdr.getAttribute('data-group-id');
-                            if (!query) {
-                                hdr.style.display = '';
-                            } else {
-                                hdr.style.display = matchingGroupIds.has(gId) ? '' : 'none';
-                            }
-                        });
-
-                        // 3. Mobile cards
-                        groupCards.forEach(function(card) {
-                            var campaignsContainer = card.querySelector('.mobile-group-campaigns');
-                            var toggle = card.querySelector('.mobile-group-header span[id^="mobile-toggle-"]');
-                            var childCards = card.querySelectorAll('.mobile-campaign-card');
-                            var groupHasMatch = false;
-
-                            childCards.forEach(function(childCard) {
-                                var searchData = childCard.getAttribute('data-search') || '';
-                                var match = !query || searchData.indexOf(query) !== -1;
-                                childCard.style.display = match ? '' : 'none';
-                                if (match) groupHasMatch = true;
-                            });
-
-                            if (!query) {
-                                card.style.display = '';
-                                if (campaignsContainer && toggle) {
-                                    campaignsContainer.style.display = toggle.textContent === '▼' ? 'block' : 'none';
-                                }
-                            } else {
-                                card.style.display = groupHasMatch ? '' : 'none';
-                                if (campaignsContainer) {
-                                    campaignsContainer.style.display = groupHasMatch ? 'block' : 'none';
-                                }
-                            }
-                        });
-
-                        ungroupedCards.forEach(function(card) {
-                            var searchData = card.getAttribute('data-search') || '';
-                            var match = !query || searchData.indexOf(query) !== -1;
-                            card.style.display = match ? '' : 'none';
-                        });
-
-                        // 4. Update count text
-                        var countEl = document.getElementById('campaignSearchCount');
-                        if (countEl) {
-                            if (query) {
-                                countEl.textContent = 'Showing ' + visibleCount + ' of ' + totalCount + ' campaigns';
-                            } else {
-                                countEl.textContent = totalCount + ' total campaigns';
-                            }
+                    function copyCampaignListTrackingLink(btn) {
+                        if (!btn) return;
+                        var url = btn.getAttribute('data-tracking-url') || '';
+                        if (!url) return;
+                        var original = btn.textContent;
+                        var done = function () {
+                            btn.textContent = btn.classList.contains('campaign-action-btn') ? '✓' : '✓ Copied';
+                            setTimeout(function () { btn.textContent = original; }, 1500);
+                        };
+                        var fallback = function () {
+                            var ta = document.createElement('textarea');
+                            ta.value = url;
+                            ta.setAttribute('readonly', '');
+                            ta.style.position = 'fixed';
+                            ta.style.left = '-9999px';
+                            document.body.appendChild(ta);
+                            ta.select();
+                            try { document.execCommand('copy'); done(); } catch (e) {}
+                            document.body.removeChild(ta);
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(url).then(done).catch(fallback);
+                        } else {
+                            fallback();
                         }
                     }
 
-                    document.addEventListener('DOMContentLoaded', function() {
-                        if (document.getElementById('campaignSearchInput')) {
-                            filterCampaignsTable();
+                    (function initCampaignListSearch() {
+                        var input = document.getElementById('campaignSearchInput');
+                        if (!input) return;
+                        var timer = null;
+                        var lastSubmitted = <?= json_encode($campaignsSearchQ) ?>;
+                        function go() {
+                            var q = (input.value || '').trim();
+                            if (q === lastSubmitted) return;
+                            var url = new URL(window.location.href);
+                            url.searchParams.set('campaigns_page', '1');
+                            if (q) { url.searchParams.set('campaigns_q', q); }
+                            else { url.searchParams.delete('campaigns_q'); }
+                            window.location = url.toString();
                         }
-                    });
+                        input.addEventListener('input', function () {
+                            clearTimeout(timer);
+                            timer = setTimeout(go, 400);
+                        });
+                        input.addEventListener('keydown', function (e) {
+                            if (e.key === 'Enter') {
+                                e.preventDefault();
+                                clearTimeout(timer);
+                                go();
+                            }
+                        });
+                    })();
                 </script>
                 
 </div>
@@ -2136,6 +2407,7 @@ if ($editCampaign && isset($editCampaign['id'])) {
                             var conv = s.conversions || 0;
                             var cost = s.cost || 0;
                             var revenue = s.revenue || 0;
+                            var profit = (typeof s.profit === 'number') ? s.profit : (revenue - cost);
                             var roi = s.roi || 0;
 
                             document.querySelectorAll('[data-campaign-id="' + id + '"]').forEach(function(root) {
@@ -2144,6 +2416,7 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                 root.setAttribute('data-sort-conv', conv);
                                 root.setAttribute('data-sort-cost', cost);
                                 root.setAttribute('data-sort-revenue', revenue);
+                                root.setAttribute('data-sort-profit', profit);
                                 root.setAttribute('data-sort-roi', roi);
 
                                 var el;
@@ -2157,6 +2430,12 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                     el.style.color = revenue > 0 ? '#28a745' : '#666';
                                     el.style.fontWeight = revenue > 0 ? '600' : '400';
                                 }
+                                el = root.querySelector('.cl-stat-profit');
+                                if (el) {
+                                    el.textContent = fmtMoney(profit);
+                                    el.style.color = profit >= 0 ? '#28a745' : '#d32f2f';
+                                    el.style.fontWeight = '600';
+                                }
                                 el = root.querySelector('.cl-stat-roi');
                                 if (el) {
                                     el.textContent = fmtRoi(roi);
@@ -2169,13 +2448,14 @@ if ($editCampaign && isset($editCampaign['id'])) {
                             document.querySelectorAll('tr.group-header[data-group-id]').forEach(function(header) {
                                 var gid = header.getAttribute('data-group-id');
                                 var rows = document.querySelectorAll('tr.campaign-row[data-group-id="' + gid + '"]');
-                                var views = 0, clicks = 0, conv = 0, cost = 0, revenue = 0;
+                                var views = 0, clicks = 0, conv = 0, cost = 0, revenue = 0, profit = 0;
                                 rows.forEach(function(row) {
                                     views += parseFloat(row.getAttribute('data-sort-views') || '0') || 0;
                                     clicks += parseFloat(row.getAttribute('data-sort-clicks') || '0') || 0;
                                     conv += parseFloat(row.getAttribute('data-sort-conv') || '0') || 0;
                                     cost += parseFloat(row.getAttribute('data-sort-cost') || '0') || 0;
                                     revenue += parseFloat(row.getAttribute('data-sort-revenue') || '0') || 0;
+                                    profit += parseFloat(row.getAttribute('data-sort-profit') || '0') || 0;
                                 });
                                 var roi = cost > 0 ? ((revenue - cost) / cost) * 100 : (revenue > 0 ? 99999.9 : 0);
                                 header.setAttribute('data-sort-views', views);
@@ -2183,6 +2463,7 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                 header.setAttribute('data-sort-conv', conv);
                                 header.setAttribute('data-sort-cost', cost);
                                 header.setAttribute('data-sort-revenue', revenue);
+                                header.setAttribute('data-sort-profit', profit);
                                 header.setAttribute('data-sort-roi', roi);
                                 var el;
                                 el = header.querySelector('.cl-stat-views'); if (el) el.textContent = fmtInt(views);
@@ -2193,6 +2474,11 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                 if (el) {
                                     el.textContent = fmtMoney(revenue);
                                     el.style.color = revenue > 0 ? '#28a745' : '#666';
+                                }
+                                el = header.querySelector('.cl-stat-profit');
+                                if (el) {
+                                    el.textContent = fmtMoney(profit);
+                                    el.style.color = profit >= 0 ? '#28a745' : '#d32f2f';
                                 }
                                 el = header.querySelector('.cl-stat-roi');
                                 if (el) {
@@ -2207,6 +2493,11 @@ if ($editCampaign && isset($editCampaign['id'])) {
                                     el = mobileSummary.querySelector('.cl-stat-conv'); if (el) el.textContent = fmtInt(conv);
                                     el = mobileSummary.querySelector('.cl-stat-cost'); if (el) el.textContent = fmtMoney(cost);
                                     el = mobileSummary.querySelector('.cl-stat-revenue'); if (el) el.textContent = fmtMoney(revenue);
+                                    el = mobileSummary.querySelector('.cl-stat-profit');
+                                    if (el) {
+                                        el.textContent = fmtMoney(profit);
+                                        el.style.color = profit >= 0 ? '#28a745' : '#d32f2f';
+                                    }
                                     el = mobileSummary.querySelector('.cl-stat-roi'); if (el) el.textContent = fmtRoi(roi);
                                 }
                             });
@@ -2260,80 +2551,14 @@ if ($editCampaign && isset($editCampaign['id'])) {
                     (function initCampaignsTableSort() {
                         var table = document.querySelector('.campaigns-table-sortable');
                         if (!table) return;
-                        var tbody = table.tBodies[0];
-                        if (!tbody) return;
                         var stringKeys = { name: 1, traffic_source: 1, flow_type: 1, status: 1 };
-
-                        function parseVal(raw, type) {
-                            if (raw == null || raw === '') {
-                                return type === 'string' ? '' : 0;
-                            }
-                            if (type === 'string') return String(raw).toLowerCase();
-                            var n = parseFloat(raw);
-                            return isNaN(n) ? 0 : n;
-                        }
-
-                        function compareRows(a, b, attr, type, dir) {
-                            var va = parseVal(a.getAttribute(attr), type);
-                            var vb = parseVal(b.getAttribute(attr), type);
-                            if (type === 'string') {
-                                var c = String(va).localeCompare(String(vb), undefined, { sensitivity: 'base', numeric: true });
-                                return dir === 'asc' ? c : -c;
-                            }
-                            return dir === 'asc' ? (va - vb) : (vb - va);
-                        }
-
-                        function refreshIndicators() {
-                            var key = table.getAttribute('data-sort-key') || '';
-                            var dir = table.getAttribute('data-sort-dir') || 'asc';
-                            table.querySelectorAll('.sortable-col').forEach(function(th) {
-                                var span = th.querySelector('.sort-indicator');
-                                if (!span) return;
-                                span.textContent = (th.getAttribute('data-sort-key') === key)
-                                    ? (dir === 'asc' ? '↑' : '↓')
-                                    : '↕';
-                            });
-                        }
-
-                        function sortTable(key, type, dir) {
-                            var attr = 'data-sort-' + key;
-                            var headers = Array.from(tbody.querySelectorAll('tr.group-header'));
-                            var units = headers.map(function(header) {
-                                var gid = header.getAttribute('data-group-id');
-                                var members = Array.from(tbody.querySelectorAll('tr.campaign-row[data-group-id="' + gid + '"]'));
-                                members.sort(function(a, b) {
-                                    return compareRows(a, b, attr, type, dir);
-                                });
-                                return { header: header, members: members };
-                            });
-
-                            units.sort(function(a, b) {
-                                return compareRows(a.header, b.header, attr, type, dir);
-                            });
-
-                            var ungrouped = Array.from(tbody.querySelectorAll('tr.campaign-row:not([data-group-id])'));
-                            ungrouped.sort(function(a, b) {
-                                return compareRows(a, b, attr, type, dir);
-                            });
-
-                            var frag = document.createDocumentFragment();
-                            units.forEach(function(unit) {
-                                frag.appendChild(unit.header);
-                                unit.members.forEach(function(row) {
-                                    frag.appendChild(row);
-                                });
-                            });
-                            ungrouped.forEach(function(row) {
-                                frag.appendChild(row);
-                            });
-                            tbody.appendChild(frag);
-                        }
-
+                        // Header clicks navigate so sort runs on the full filtered set before pagination.
                         table.querySelector('thead').addEventListener('click', function(e) {
                             var th = e.target && e.target.closest ? e.target.closest('.sortable-col') : null;
                             if (!th || !table.contains(th)) return;
                             e.preventDefault();
                             var key = th.getAttribute('data-sort-key');
+                            if (!key) return;
                             var type = th.getAttribute('data-sort-type') || (stringKeys[key] ? 'string' : 'number');
                             var currentKey = table.getAttribute('data-sort-key') || '';
                             var currentDir = table.getAttribute('data-sort-dir') || 'asc';
@@ -2343,13 +2568,14 @@ if ($editCampaign && isset($editCampaign['id'])) {
                             } else {
                                 dir = type === 'string' ? 'asc' : 'desc';
                             }
-                            table.setAttribute('data-sort-key', key);
-                            table.setAttribute('data-sort-dir', dir);
-                            sortTable(key, type, dir);
-                            refreshIndicators();
-                            if (typeof filterCampaignsTable === 'function') {
-                                filterCampaignsTable();
+                            var url = new URL(window.location.href);
+                            url.searchParams.set('campaigns_sort', key);
+                            url.searchParams.set('campaigns_dir', dir);
+                            url.searchParams.set('campaigns_page', '1');
+                            if (!url.searchParams.get('campaigns_per_page')) {
+                                url.searchParams.set('campaigns_per_page', '25');
                             }
+                            window.location = url.toString();
                         });
                     })();
                 </script>
@@ -3622,7 +3848,12 @@ whop.track("page");
 
                 <div style="margin-bottom: 20px;">
                     <p style="color: #333; margin-bottom: 12px; font-weight: 600; font-size: 14px;">Step 2: Configure Your CTA Button</p>
+                    <p style="font-size: 12px; color: #666; margin: 0 0 12px 0; line-height: 1.5;">
+                        Use <strong>either</strong> path below — both stay supported. Existing LPs already on <code>kTrack()</code> or on a direct <code>/lp/click.php</code> link keep working after updates; pick one style per button, not both on the same click.
+                    </p>
+
                     <div style="background: #ffffff; border: 1px solid #ddd; border-radius: 4px; padding: 12px; margin-bottom: 12px;">
+                        <p style="margin: 0 0 8px 0; color: #333; font-weight: 600; font-size: 13px;">Option A — JavaScript <code>kTrack()</code> <span style="font-weight: 500; color: #666;">(most LPs)</span></p>
                         <code style="font-size: 13px; color: var(--accent); display: block; white-space: pre-wrap;">&lt;a href="#" onclick="kTrack(); return false;"&gt;
     Click Here
 &lt;/a&gt;</code>
@@ -3630,10 +3861,40 @@ whop.track("page");
                                 style="margin-top: 8px; padding: 4px 12px; font-size: 12px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer;">
                             📋 Copy
                         </button>
+                        <p style="font-size: 12px; color: #666; margin: 8px 0 0 0;">Requires <code>chomp.js</code> from Step 1. Tracks the click and redirects to your offer (weighted rotation).</p>
                     </div>
-                    <p style="font-size: 12px; color: #666; margin: 0;">Replace your CTA button with this code. The <code>kTrack()</code> function will automatically track the click and redirect to your offer (weighted rotation).</p>
+
+                    <div style="background: #ffffff; border: 1px solid #ddd; border-radius: 4px; padding: 12px; margin-bottom: 12px;">
+                        <p style="margin: 0 0 8px 0; color: #333; font-weight: 600; font-size: 13px;">Option B — Direct LP click URL <span style="font-weight: 500; color: #666;">(no <code>onclick</code>)</span></p>
+                        <p style="font-size: 12px; color: #666; margin: 0 0 8px 0; line-height: 1.5;">
+                            Same endpoint <code>kTrack()</code> uses under the hood. Useful for PHP LPs, page builders, or any CTA that can set a real <code>href</code> with the visitor’s <code>click_id</code> (from the <code>/km/</code> redirect URL, cookie, or redirectless track).
+                        </p>
+                        <p style="margin: 0 0 6px 0; font-size: 12px; color: #666; font-weight: 600;">Base URL</p>
+                        <code id="lp-click-url-base-display" style="font-size: 13px; color: var(--accent); display: block; word-break: break-all; margin-bottom: 8px;"><?= htmlspecialchars(rtrim(Formatter::getCampaignBaseUrl($editCampaign), '/')) ?>/lp/click.php?click_id=YOUR_CLICK_ID</code>
+                        <button type="button" id="copy-lp-click-url-base-btn" onclick="copyLpClickUrlBase()"
+                                style="padding: 4px 12px; font-size: 12px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer;">
+                            📋 Copy URL pattern
+                        </button>
+                        <p style="margin: 12px 0 6px 0; font-size: 12px; color: #666; font-weight: 600;">PHP example (after visit is tracked)</p>
+                        <code id="lp-click-url-php-display" style="font-size: 12px; color: var(--accent); display: block; white-space: pre-wrap;"><?php
+                            $lpClickBase = rtrim(Formatter::getCampaignBaseUrl($editCampaign), '/');
+                            echo htmlspecialchars(
+                                "<?php\n"
+                                . "\$trackerUrl = '{$lpClickBase}/lp/click.php';\n"
+                                . "\$clickId = \$_GET['click_id'] ?? \$kumaClickId ?? \$_COOKIE['kuma_click_id'] ?? '';\n"
+                                . "?>\n"
+                                . "<a href=\"<?php echo htmlspecialchars(\$trackerUrl); ?>?click_id=<?php echo htmlspecialchars(\$clickId); ?>\">Click Here</a>"
+                            );
+                        ?></code>
+                        <button type="button" id="copy-lp-click-url-php-btn" onclick="copyLpClickUrlPhp()"
+                                style="margin-top: 8px; padding: 4px 12px; font-size: 12px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer;">
+                            📋 Copy PHP example
+                        </button>
+                        <p style="font-size: 12px; color: #666; margin: 8px 0 0 0;">Optional offer targeting: add <code>&amp;o=2</code> (slot) or <code>&amp;offer_id=123</code> / <code>&amp;k=…</code> (opaque key) — same as <code>kTrack(2)</code> / <code>kTrackKey()</code>.</p>
+                    </div>
+
                     <div style="background: #ffffff; border: 1px solid #ddd; border-radius: 4px; padding: 12px; margin-top: 12px;">
-                        <p style="margin: 0 0 8px 0; color: #333; font-weight: 600; font-size: 13px;">Optional: link to a specific offer</p>
+                        <p style="margin: 0 0 8px 0; color: #333; font-weight: 600; font-size: 13px;">Optional: link to a specific offer <span style="font-weight: 500; color: #666;">(Option A)</span></p>
                         <p style="font-size: 12px; color: #666; margin: 0 0 8px 0;">Use the offer’s position in this campaign’s offer list (1 = first enabled offer, 2 = second, …). Plain <code>kTrack()</code> still auto-rotates.</p>
                         <code style="font-size: 13px; color: var(--accent); display: block; white-space: pre-wrap;">&lt;a href="#" onclick="kTrack(2); return false;"&gt;Go to Offer 2&lt;/a&gt;
 &lt;!-- or: --&gt;
@@ -4015,14 +4276,69 @@ $clickId = $_GET['click_id'] ?? $kumaClickId ?? $_COOKIE['kuma_click_id'] ?? '';
             return campaignBaseUrl;
         }
         
-        // Update chomp.js code when tracking domain changes
+        // Update chomp.js + LP click URL snippets when tracking domain changes
         function updateChompJSCode() {
+            const trackingDomainUrl = getCampaignTrackingDomainUrl().replace(/\/$/, '');
             const chompCodeElement = document.getElementById('chomp-js-code-display');
             if (chompCodeElement) {
-                const trackingDomainUrl = getCampaignTrackingDomainUrl();
                 const chompCode = `&lt;script src="${trackingDomainUrl}/chomp.js"&gt;&lt;/script&gt;`;
                 chompCodeElement.textContent = chompCode;
             }
+            updateLpClickUrlSnippets(trackingDomainUrl);
+        }
+
+        function updateLpClickUrlSnippets(trackingDomainUrl) {
+            const base = (trackingDomainUrl || getCampaignTrackingDomainUrl()).replace(/\/$/, '');
+            const baseEl = document.getElementById('lp-click-url-base-display');
+            if (baseEl) {
+                baseEl.textContent = base + '/lp/click.php?click_id=YOUR_CLICK_ID';
+            }
+            const phpEl = document.getElementById('lp-click-url-php-display');
+            if (phpEl) {
+                const phpOpen = '<' + '?php';
+                const phpClose = '?' + '>';
+                phpEl.textContent =
+                    phpOpen + '\n'
+                    + "$trackerUrl = '" + base + "/lp/click.php';\n"
+                    + "$clickId = $_GET['click_id'] ?? $kumaClickId ?? $_COOKIE['kuma_click_id'] ?? '';\n"
+                    + phpClose + '\n'
+                    + '<a href="' + phpOpen + ' echo htmlspecialchars($trackerUrl); ' + phpClose
+                    + '?click_id=' + phpOpen + ' echo htmlspecialchars($clickId); ' + phpClose
+                    + '">Click Here</a>';
+            }
+        }
+
+        function flashCopyButton(btn) {
+            if (!btn) return;
+            const prev = btn.textContent;
+            btn.textContent = '✓ Copied';
+            setTimeout(function() { btn.textContent = prev; }, 1500);
+        }
+
+        function copyPlainSnippet(text, buttonElement) {
+            const done = function() { flashCopyButton(buttonElement); };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(done).catch(function() {
+                    copyToClipboard(text.replace(/</g, '&lt;').replace(/>/g, '&gt;'), buttonElement);
+                });
+            } else {
+                copyToClipboard(text.replace(/</g, '&lt;').replace(/>/g, '&gt;'), buttonElement);
+            }
+        }
+
+        function copyLpClickUrlBase() {
+            const base = getCampaignTrackingDomainUrl().replace(/\/$/, '');
+            copyPlainSnippet(
+                base + '/lp/click.php?click_id=YOUR_CLICK_ID',
+                document.getElementById('copy-lp-click-url-base-btn')
+            );
+        }
+
+        function copyLpClickUrlPhp() {
+            const phpEl = document.getElementById('lp-click-url-php-display');
+            const text = phpEl ? phpEl.textContent : '';
+            if (!text) return;
+            copyPlainSnippet(text, document.getElementById('copy-lp-click-url-php-btn'));
         }
         
         // NEW FUNCTION: Fix the display of chomp.js code to show actual script tags

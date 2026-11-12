@@ -104,15 +104,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ];
         }
 
+        // Outbound conversion postbacks are configured under Settings → Integrations
+        // (Custom Postbacks). The traffic-source UI field was removed as redundant.
+        // Preserve any existing DB template (RollerAds / NewsBreak still fire from it),
+        // and seed from the built-in template on create when applicable.
+        $providerKey = trim((string) ($_POST['provider_key'] ?? '')) !== ''
+            ? trim((string) $_POST['provider_key'])
+            : null;
+        $sourceName = (string) ($_POST['name'] ?? '');
+        $postbackTemplate = '';
+        if ($action === 'edit' && $id) {
+            $existingSource = $trafficSource->getById($id);
+            $postbackTemplate = trim((string) ($existingSource['postback_template'] ?? ''));
+        } else {
+            $allTemplates = TrafficSourceTemplates::all();
+            $templateKey = $providerKey !== null && isset($allTemplates[$providerKey])
+                ? $providerKey
+                : null;
+            if ($templateKey === null) {
+                $nameLower = strtolower(trim($sourceName));
+                foreach ($allTemplates as $key => $tpl) {
+                    if (strtolower((string) ($tpl['name'] ?? '')) === $nameLower) {
+                        $templateKey = $key;
+                        break;
+                    }
+                }
+            }
+            if ($templateKey !== null) {
+                $postbackTemplate = trim((string) ($allTemplates[$templateKey]['postback_template'] ?? ''));
+            }
+        }
+
         $data = [
-            'name' => $_POST['name'] ?? '',
-            'postback_template' => trim((string) ($_POST['postback_template'] ?? '')),
+            'name' => $sourceName,
+            'postback_template' => $postbackTemplate,
             'cost_tracking_method' => $_POST['cost_tracking_method'] ?? 'manual_token',
             'cost_param_key' => $_POST['cost_param_key'] ?? '',
             'cost_currency' => $_POST['cost_currency'] ?? '',
-            'provider_key' => trim((string) ($_POST['provider_key'] ?? '')) !== ''
-                ? trim((string) $_POST['provider_key'])
-                : null,
+            'provider_key' => $providerKey,
             'tokens' => $tokens,
         ];
 
@@ -470,19 +499,6 @@ $db->close();
                     </div>
                 </div>
 
-                <div style="margin-bottom: 24px;">
-                    <label style="display: block; font-weight: 600; margin-bottom: 8px;" for="postback_template">Conversion postback URL</label>
-                    <textarea name="postback_template" id="postback_template" rows="3"
-                              placeholder="Optional. Leave blank if this network does not take a conversion postback."
-                              style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 4px; font-size: 13px;"><?= htmlspecialchars((string) ($editSource['postback_template'] ?? $_POST['postback_template'] ?? '')) ?></textarea>
-                    <div style="font-size: 12px; color: #666; margin-top: 4px;">
-                        RollerAds does not offer a spend API. Cost stays the <code>cost</code> parameter on the click.
-                        Their conversion postback is generated under Campaigns → Tracking. Replace
-                        <code>YOUR_ACCOUNT_NUMBER</code> and <code>YOUR_TRACKING_KEY</code> with that URL’s values.
-                        Kuma sends their click id, the payout, and goal 1. The call is skipped until those two placeholders are replaced.
-                    </div>
-                </div>
-                
                 <script>
                 function toggleCostParamFields() {
                     const method = document.getElementById('cost_tracking_method').value;
@@ -830,10 +846,6 @@ $db->close();
                 document.querySelector('select[name="cost_tracking_method"]').value = template.cost_tracking_method || 'manual_token';
             }
             document.querySelector('input[name="cost_param_key"]').value = template.cost_param_key || '';
-            const postbackField = document.getElementById('postback_template');
-            if (postbackField) {
-                postbackField.value = template.postback_template || '';
-            }
             const currencySelect = document.querySelector('select[name="cost_currency"]');
             if (currencySelect) {
                 currencySelect.value = template.cost_currency || 'USD';

@@ -6,6 +6,7 @@ namespace SimpleKuma\Honeycomb;
 
 use mysqli;
 use RuntimeException;
+use SimpleKuma\Database\SchemaProbe;
 
 /**
  * Shared hourly/daily spend snapshots written by CostSyncJob addons.
@@ -18,8 +19,7 @@ final class HourlyCostStore
 
     public function tableExists(): bool
     {
-        $result = $this->db->query("SHOW TABLES LIKE 'honeycomb_campaign_hourly_costs'");
-        return $result !== false && $result->num_rows > 0;
+        return SchemaProbe::tableExists($this->db, 'honeycomb_campaign_hourly_costs');
     }
 
     /**

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace SimpleKuma\Stats;
 
 use mysqli;
+use SimpleKuma\Database\SchemaProbe;
 
 /**
  * Deep Funnel reporting from clicks_funnel_step_daily + clicks_funnel_path_daily only.
@@ -18,9 +19,8 @@ final class FunnelStatsService
 
     public function tablesReady(): bool
     {
-        $r1 = $this->db->query("SHOW TABLES LIKE 'clicks_funnel_step_daily'");
-        $r2 = $this->db->query("SHOW TABLES LIKE 'clicks_funnel_path_daily'");
-        return ($r1 && $r1->num_rows > 0 && $r2 && $r2->num_rows > 0);
+        return SchemaProbe::tableExists($this->db, 'clicks_funnel_step_daily')
+            && SchemaProbe::tableExists($this->db, 'clicks_funnel_path_daily');
     }
 
     /**

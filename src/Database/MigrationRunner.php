@@ -65,6 +65,8 @@ class MigrationRunner
             }
 
             $this->applied[] = $migration;
+            // New tables/columns must not stay "missing" in SchemaProbe's file/APCu cache.
+            SchemaProbe::flush();
         }
 
         return true;

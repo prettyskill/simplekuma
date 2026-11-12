@@ -287,6 +287,7 @@ if ($page === 'visitors' && isset($_GET['export']) && $_GET['export'] === 'csv')
     require_once __DIR__ . '/../src/Utils/Formatter.php';
     $csvDb = new mysqli(DB_HOST, DB_USER, DB_PASSWORD, DB_NAME);
     DbTimezone::init($csvDb);
+    \SimpleKuma\Database\DatabaseCompatibility::applyReportingQueryTimeout($csvDb, 60);
 
     $csvTz = ($currentUser && isset($currentUser['timezone'])) ? $currentUser['timezone'] : 'UTC';
     $todayInTz = \SimpleKuma\Utils\Formatter::getTodayInTimezone($csvTz);
@@ -294,86 +295,87 @@ if ($page === 'visitors' && isset($_GET['export']) && $_GET['export'] === 'csv')
     $dateTo = $_GET['date_to'] ?? $todayInTz;
     $utcRange = \SimpleKuma\Utils\Formatter::convertDateRangeToUTC($dateFrom, $dateTo, $csvTz);
 
-    // Filters
-    $campaignFilter = isset($_GET['campaign']) ? (int)$_GET['campaign'] : null;
+    $campaignFilter = isset($_GET['campaign']) ? (int) $_GET['campaign'] : null;
     $hasConversion = $_GET['has_conversion'] ?? null;
-
-    // Build WHERE clause - use UTC bounds for correct timezone-aware filtering
-    $where = ["cl.ts >= ? AND cl.ts <= ?"];
-    $params = [$utcRange['from'], $utcRange['to']];
-    $types = 'ss';
-    
-    if ($campaignFilter) {
-        $where[] = "cl.campaign_id = ?";
-        $params[] = $campaignFilter;
-        $types .= 'i';
+    if (!isset($_GET['exclude_fb_approval'])) {
+        $excludeFbApprovalTeam = true;
+    } else {
+        $excludeFbApprovalTeam = $_GET['exclude_fb_approval'] === '1';
     }
-    
-    if ($hasConversion === '1' || $hasConversion === 1) {
-        $where[] = "conv.id IS NOT NULL";
-    } elseif ($hasConversion === 'clicked' || $hasConversion === 2) {
-        $where[] = "cl.lp_click = TRUE";
-    }
-    
-    $whereClause = implode(' AND ', $where);
-    
-    // Fetch all matching clicks (no pagination for export)
-    $sql = "SELECT 
-                cl.ts, cl.click_id, cp.name as campaign, cl.ip, cl.country, cl.region, cl.city,
-                cl.device, cl.os, cl.browser, ts.name as traffic_source, cl.lp_click,
-                conv.value as conv_value, conv.payout as conv_payout, conv.currency,
-                conv.id as has_conversion
-            FROM clicks cl
-            INNER JOIN campaigns cp ON cl.campaign_id = cp.id
-            LEFT JOIN traffic_sources ts ON cp.traffic_source_id = ts.id
-            LEFT JOIN conversions conv ON cl.click_id = conv.click_id
-            WHERE {$whereClause}
-            ORDER BY cl.ts DESC";
-    
-    $stmt = $csvDb->prepare($sql);
-    $stmt->bind_param($types, ...$params);
-    $stmt->execute();
-    $result = $stmt->get_result();
 
-    // Output CSV headers (filename date in user timezone)
+    $visitorLog = new \SimpleKuma\Stats\VisitorLogQueryService($csvDb);
+    $exportRows = [];
+    $tokenKeySet = [];
+    $pageNum = 1;
+    $perPage = 500;
+    $total = null;
+    do {
+        $chunk = $visitorLog->list([
+            'utc_from' => $utcRange['from'],
+            'utc_to' => $utcRange['to'],
+            'campaign_id' => $campaignFilter,
+            'has_conversion' => $hasConversion,
+            'exclude_fb_approval' => $excludeFbApprovalTeam,
+            'page' => $pageNum,
+            'per_page' => $perPage,
+        ]);
+        if ($total === null) {
+            $total = (int) $chunk['total'];
+        }
+        foreach ($chunk['rows'] as $row) {
+            $exportRows[] = $row;
+            foreach (array_keys($row['click_tokens'] ?? []) as $tk) {
+                $tokenKeySet[$tk] = true;
+            }
+        }
+        $pageNum++;
+    } while (count($exportRows) < $total && $chunk['rows'] !== []);
+
+    $clickTokenKeys = array_keys($tokenKeySet);
+    sort($clickTokenKeys);
+
     header('Content-Type: text/csv');
     header('Content-Disposition: attachment; filename="visitor-log-' . $todayInTz . '.csv"');
-    
+
     $output = fopen('php://output', 'w');
-    fputcsv($output, ['Timestamp', 'Click ID', 'Campaign', 'IP', 'Country', 'City', 'State', 'Device', 'OS', 'Browser', 'Traffic Source', 'LP Click', 'Conversion', 'Revenue']);
-    
-    while ($row = $result->fetch_assoc()) {
-        // Determine conversion status - check if conv.id exists
-        $hasConversion = !empty($row['has_conversion']);
-        
-        // Revenue: prefer payout over value (same logic as visitor log page)
+    fputcsv($output, array_merge(
+        ['Timestamp', 'Click ID', 'Campaign', 'IP', 'Country', 'City', 'State', 'Device', 'OS', 'Browser', 'Traffic Source', 'LP Click', 'Conversion', 'Revenue'],
+        $clickTokenKeys
+    ));
+
+    foreach ($exportRows as $row) {
+        $hasConv = !empty($row['has_conversion']);
         $revenue = '';
-        if ($hasConversion) {
+        if ($hasConv) {
             if (!empty($row['conv_payout'])) {
                 $revenue = $row['conv_payout'];
             } elseif (!empty($row['conv_value'])) {
                 $revenue = $row['conv_value'];
             }
         }
-        
-        fputcsv($output, [
+        $tokens = $row['click_tokens'] ?? [];
+        $tokenCells = [];
+        foreach ($clickTokenKeys as $tokenKey) {
+            $tokenCells[] = $tokens[$tokenKey] ?? '';
+        }
+        fputcsv($output, array_merge([
             \SimpleKuma\Utils\Formatter::formatDateTime($row['ts'], $csvTz),
             $row['click_id'],
-            $row['campaign'],
-            $row['ip'],
+            $row['campaign_name'] ?? '',
+            $row['ip'] ?? '',
             $row['country'] ?? '',
             $row['city'] ?? '',
             $row['region'] ?? '',
             $row['device'] ?? '',
             $row['os'] ?? '',
             $row['browser'] ?? '',
-            $row['traffic_source'] ?? 'N/A',
-            $row['lp_click'] ? 'Yes' : 'No',
-            $hasConversion ? 'Yes' : 'No',
+            $row['traffic_source_name'] ?? 'N/A',
+            !empty($row['lp_click']) ? 'Yes' : 'No',
+            $hasConv ? 'Yes' : 'No',
             $revenue,
-        ]);
+        ], $tokenCells));
     }
-    
+
     fclose($output);
     $csvDb->close();
     exit;
@@ -392,10 +394,11 @@ if ($page === 'conversions' && isset($_GET['export']) && $_GET['export'] === 'cs
     if ($campaignFilter === 0) {
         $campaignFilter = null;
     }
-    $eventTypeFilter = isset($_GET['event_type']) ? (string) $_GET['event_type'] : 'all';
-    if (!in_array($eventTypeFilter, ['all', 'optins', 'conversions'], true)) {
-        $eventTypeFilter = 'all';
-    }
+    $parsedEventType = \SimpleKuma\Stats\ConversionsQueryService::parseEventTypeParam(
+        isset($_GET['event_type']) ? (string) $_GET['event_type'] : 'all'
+    );
+    $eventTypeFilter = $parsedEventType['event_type'];
+    $eventKeyExact = $parsedEventType['event_key'];
     $extraFilters = \SimpleKuma\Tracking\ConversionPostbackParams::parseLogFilters($_GET);
 
     $service = new \SimpleKuma\Stats\ConversionsQueryService($db);
@@ -409,7 +412,8 @@ if ($page === 'conversions' && isset($_GET['export']) && $_GET['export'] === 'cs
         100000,
         0,
         $eventTypeFilter,
-        $extraFilters
+        $extraFilters,
+        $eventKeyExact
     );
 
     $reportKeys = \SimpleKuma\Tracking\ConversionPostbackParams::reportKeys();

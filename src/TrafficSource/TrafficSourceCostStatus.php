@@ -132,7 +132,7 @@ class TrafficSourceCostStatus
     private static function liveApiHelpNote(array $ts): string
     {
         if (TrafficSourceReleaseHelper::usesNewsBreakIntegration($ts)) {
-            return 'Cost syncs hourly via the built-in NewsBreak integration (Settings → API Cost Updates). Conversions post back using the traffic source postback URL.';
+            return 'Cost syncs hourly via the built-in NewsBreak integration (Settings → API Cost Updates). Conversions post back via Custom Postbacks (or the NewsBreak template default).';
         }
 
         $providerKey = trim((string) ($ts['provider_key'] ?? ''));

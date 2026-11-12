@@ -1021,12 +1021,19 @@ class DailySummaryUpdater
             return;
         }
         $isOptIn = ConversionOptInClassifier::isOptIn($eventKey);
-        $revenue = $isOptIn ? 0.0 : ($payout !== null ? (float) $payout : ($value !== null ? (float) $value : 0.0));
-        $conversionsDelta = $isOptIn ? 0 : 1;
+        $countsAsConversion = ConversionStatsClassifier::countsAsConversion($eventKey, $this->db);
+        $revenue = $countsAsConversion
+            ? ($payout !== null ? (float) $payout : ($value !== null ? (float) $value : 0.0))
+            : 0.0;
+        $conversionsDelta = $countsAsConversion ? 1 : 0;
         $optinsDelta = $isOptIn ? 1 : 0;
         $hasOptinsCol = $this->summaryTableHasOptinsColumn();
         if ($isOptIn && !$hasOptinsCol) {
             // Column missing: still store conversion row, but skip summary until migration runs
+            return;
+        }
+        if (!$countsAsConversion && !$isOptIn) {
+            // Funnel / non-allowlisted event: stored on conversions table only (no KPI bump).
             return;
         }
 
@@ -1251,11 +1258,17 @@ class DailySummaryUpdater
             return;
         }
         $isOptIn = ConversionOptInClassifier::isOptIn($eventKey);
-        $revenue = $isOptIn ? 0.0 : ($payout !== null ? (float) $payout : ($value !== null ? (float) $value : 0.0));
-        $conversionsDelta = $isOptIn ? 0 : -1;
+        $countsAsConversion = ConversionStatsClassifier::countsAsConversion($eventKey, $this->db);
+        $revenue = $countsAsConversion
+            ? ($payout !== null ? (float) $payout : ($value !== null ? (float) $value : 0.0))
+            : 0.0;
+        $conversionsDelta = $countsAsConversion ? -1 : 0;
         $optinsDelta = $isOptIn ? -1 : 0;
         $hasOptinsCol = $this->summaryTableHasOptinsColumn();
         if ($isOptIn && !$hasOptinsCol) {
+            return;
+        }
+        if ($conversionsDelta === 0 && $optinsDelta === 0) {
             return;
         }
 

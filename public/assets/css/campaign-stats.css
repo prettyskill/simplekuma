@@ -494,6 +494,28 @@
     gap: 6px;
 }
 
+.stats-v2-layout-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted, #666);
+    white-space: nowrap;
+}
+
+.stats-v2-layout-label select {
+    font-size: 13px;
+    padding: 4px 8px;
+}
+
+.stats-v2-table th[data-col^="dim-"],
+.stats-v2-table td[data-col^="dim-"] {
+    white-space: nowrap;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .stats-v2-breakdown-run {
     display: flex;
     flex-wrap: wrap;

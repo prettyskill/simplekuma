@@ -6,6 +6,7 @@ namespace SimpleKuma\Honeycomb;
 
 use mysqli;
 use RuntimeException;
+use SimpleKuma\Database\SchemaProbe;
 use SimpleKuma\Utils\SecretEncryption;
 
 /**
@@ -19,8 +20,7 @@ final class CredentialStore
 
     public function tableExists(): bool
     {
-        $result = $this->db->query("SHOW TABLES LIKE 'honeycomb_credentials'");
-        return $result !== false && $result->num_rows > 0;
+        return SchemaProbe::tableExists($this->db, 'honeycomb_credentials');
     }
 
     /**

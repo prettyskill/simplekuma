@@ -431,7 +431,7 @@ final class DashboardStatsService
                     COALESCE(SUM(conv.revenue_sum), 0) AS revenue
                 FROM " . $this->clicksTable() . " cl
                 LEFT JOIN traffic_sources ts ON cl.traffic_source_id = ts.id
-                " . CampaignStatsExpressions::conversionsAggJoin('cl', $this->clicksTable()) . "
+                " . CampaignStatsExpressions::conversionsAggJoin('cl', $this->clicksTable(), true, $this->db) . "
                 WHERE cl.campaign_id = ?
                   AND cl.ts >= ? AND cl.ts <= ?
                   AND cl.traffic_source_id IS NOT NULL
@@ -682,6 +682,7 @@ final class DashboardStatsService
         if ($idx && $idx->num_rows > 0) {
             $force = ' FORCE INDEX (idx_clicks_ts_stats_cover)';
         }
+        $convWhere = \SimpleKuma\Tracking\ConversionStatsClassifier::conversionWhereSql('cv.event_key', $this->db);
         $convSql = "
             SELECT COUNT(*) AS conversions,
                    COALESCE(SUM(COALESCE(cv.payout, cv.value)), 0) AS revenue
@@ -691,6 +692,7 @@ final class DashboardStatsService
             WHERE cl.ts >= ? AND cl.ts <= ?
             {$includedSql}
             {$convStatusSql}
+              AND {$convWhere}
         ";
         $conversions = 0;
         $revenue = 0.0;
@@ -981,6 +983,7 @@ final class DashboardStatsService
             $params = array_merge($params, $allowedStatuses);
         }
         $includedSql = $this->includedClickSql('cl', 'clicks');
+        $convWhere = \SimpleKuma\Tracking\ConversionStatsClassifier::conversionWhereSql('cv.event_key', $this->db);
 
         $sql = "
             SELECT
@@ -1022,6 +1025,7 @@ final class DashboardStatsService
                 INNER JOIN conversions cv ON cv.click_id = cl.click_id
                 WHERE cl.ts >= ? AND cl.ts <= ?
                 {$includedSql}
+                  AND {$convWhere}
                 GROUP BY cl.campaign_id
             ) conv ON conv.campaign_id = cp.id
             WHERE 1=1 {$statusSql}
@@ -1215,6 +1219,7 @@ final class DashboardStatsService
             }
             $stmt->close();
 
+            $convWhereHour = \SimpleKuma\Tracking\ConversionStatsClassifier::conversionWhereSql('cv.event_key', $this->db);
             $convSql = "
                 SELECT HOUR(cl.ts_hour) AS hour,
                        COUNT(*) AS conversions,
@@ -1223,6 +1228,7 @@ final class DashboardStatsService
                 INNER JOIN conversions cv ON cv.click_id = cl.click_id
                 WHERE cl.ts >= ? AND cl.ts <= ?
                 {$includedSql}
+                  AND {$convWhereHour}
                 GROUP BY HOUR(cl.ts_hour)
             ";
             $convStmt = $this->db->prepare($convSql);
@@ -1277,6 +1283,7 @@ final class DashboardStatsService
             }
             $stmt->close();
 
+            $convWhereHourTz = \SimpleKuma\Tracking\ConversionStatsClassifier::conversionWhereSql('cv.event_key', $this->db);
             $convSql = "
                 SELECT {$hourExpr} AS hour,
                        COUNT(*) AS conversions,
@@ -1285,6 +1292,7 @@ final class DashboardStatsService
                 INNER JOIN conversions cv ON cv.click_id = cl.click_id
                 WHERE cl.ts >= ? AND cl.ts < ?
                 {$includedSql}
+                  AND {$convWhereHourTz}
                 GROUP BY hour
             ";
             $convStmt = $this->db->prepare($convSql);
@@ -1450,6 +1458,7 @@ final class DashboardStatsService
             $stmt->close();
         }
 
+        $convWhereDay = \SimpleKuma\Tracking\ConversionStatsClassifier::conversionWhereSql('cv.event_key', $this->db);
         $convSql = "
             SELECT {$dayExpr} AS day,
                    COUNT(*) AS conversions,
@@ -1458,6 +1467,7 @@ final class DashboardStatsService
             INNER JOIN conversions cv ON cv.click_id = cl.click_id
             WHERE cl.ts >= ? AND cl.ts <= ?
             {$includedSql}
+              AND {$convWhereDay}
             GROUP BY day
         ";
         $convStmt = $this->db->prepare($convSql);

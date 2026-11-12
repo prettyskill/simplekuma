@@ -6,6 +6,7 @@ namespace SimpleKuma\Tracking;
 
 use mysqli;
 use SimpleKuma\Database\ClicksTableResolver;
+use SimpleKuma\Database\SchemaProbe;
 use SimpleKuma\Settings\SettingsManager;
 
 /**
@@ -241,13 +242,7 @@ class ConversionTracker
 
     private function campaignsTableHasAllowMultipleConversions(): bool
     {
-        static $cached = null;
-        if ($cached !== null) {
-            return $cached;
-        }
-        $check = $this->db->query("SHOW COLUMNS FROM campaigns LIKE 'allow_multiple_conversions'");
-        $cached = ($check && $check->num_rows > 0);
-        return $cached;
+        return SchemaProbe::columnExists($this->db, 'campaigns', 'allow_multiple_conversions');
     }
 
     /**
@@ -313,8 +308,10 @@ class ConversionTracker
             $updater = new DailySummaryUpdater($this->db);
             $updater->upsertConversion($clickId, $payout, $value, $eventKey);
             // Deep Funnel path pre-agg (no-op unless funnel_path_key exists / tables present)
-            $funnelRev = $payout !== null ? (float) $payout : ($value !== null ? (float) $value : 0.0);
-            (new FunnelPathTracker($this->db))->recordConversion($clickId, $funnelRev);
+            if (ConversionStatsClassifier::countsAsConversion($eventKey, $this->db)) {
+                $funnelRev = $payout !== null ? (float) $payout : ($value !== null ? (float) $value : 0.0);
+                (new FunnelPathTracker($this->db))->recordConversion($clickId, $funnelRev);
+            }
         } else {
             error_log('ConversionTracker: INSERT failed: ' . $stmt->error);
             $stmt->close();
@@ -325,13 +322,7 @@ class ConversionTracker
 
     private function hasEventKeyColumn(): bool
     {
-        static $cached = null;
-        if ($cached !== null) {
-            return $cached;
-        }
-        $check = $this->db->query("SHOW COLUMNS FROM conversions LIKE 'event_key'");
-        $cached = ($check && $check->num_rows > 0);
-        return $cached;
+        return SchemaProbe::columnExists($this->db, 'conversions', 'event_key');
     }
 
     /**

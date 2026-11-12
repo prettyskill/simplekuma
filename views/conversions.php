@@ -65,10 +65,13 @@ if ($campaignFilter === 0) {
     $campaignFilter = null;
 }
 
-$eventTypeFilter = isset($_GET['event_type']) ? (string) $_GET['event_type'] : 'all';
-if (!in_array($eventTypeFilter, ['all', 'optins', 'conversions'], true)) {
-    $eventTypeFilter = 'all';
-}
+$eventTypeRaw = isset($_GET['event_type']) ? (string) $_GET['event_type'] : 'all';
+$parsedEventType = ConversionsQueryService::parseEventTypeParam($eventTypeRaw);
+$eventTypeFilter = $parsedEventType['event_type'];
+$eventKeyExact = $parsedEventType['event_key'];
+$eventTypeSelectValue = $eventKeyExact !== null
+    ? ('ek:' . $eventKeyExact)
+    : $eventTypeFilter;
 
 $extraFilters = ConversionPostbackParams::parseLogFilters($_GET);
 
@@ -88,6 +91,18 @@ if (!isset($_GET['date_from']) && !isset($_GET['date_to'])) {
 
 $service = new ConversionsQueryService($db);
 
+$availableEventKeys = $service->listDistinctEventKeys(
+    $campaignFilter,
+    $dateFrom,
+    $dateTo,
+    $userTimezone
+);
+// Keep a selected exact key visible even if it has no rows in the current window.
+if ($eventKeyExact !== null && !in_array($eventKeyExact, $availableEventKeys, true)) {
+    $availableEventKeys[] = $eventKeyExact;
+    sort($availableEventKeys);
+}
+
 $conversions = [];
 $cohortRows = [];
 $clickTokenKeys = [];
@@ -105,7 +120,8 @@ if ($viewMode === 'cohort') {
         $userTimezone,
         $eventTypeFilter,
         $extraFilters,
-        $cohortMaxRows
+        $cohortMaxRows,
+        $eventKeyExact
     );
     $cohortRows = $cohort['rows'];
     $conversions = $cohortRows; // for shared visible-extra detection
@@ -126,7 +142,8 @@ if ($viewMode === 'cohort') {
         null,
         null,
         $eventTypeFilter,
-        $extraFilters
+        $extraFilters,
+        $eventKeyExact
     );
     $conversions = $result['rows'];
     $totalRows = $result['total'];
@@ -344,9 +361,19 @@ $cohortTabUrl = buildConversionViewUrl('cohort', $_GET);
             <div>
                 <label style="display: block; font-weight: 600; margin-bottom: 8px; font-size: 14px;">Event type</label>
                 <select name="event_type" style="width: 100%; padding: 8px; border: 2px solid #ddd; border-radius: 4px;">
-                    <option value="all" <?= $eventTypeFilter === 'all' ? 'selected' : '' ?>>All events</option>
-                    <option value="optins" <?= $eventTypeFilter === 'optins' ? 'selected' : '' ?>>Opt-ins only</option>
-                    <option value="conversions" <?= $eventTypeFilter === 'conversions' ? 'selected' : '' ?>>Conversions only</option>
+                    <option value="all" <?= $eventTypeSelectValue === 'all' ? 'selected' : '' ?>>All events</option>
+                    <option value="optins" <?= $eventTypeSelectValue === 'optins' ? 'selected' : '' ?>>Opt-ins only</option>
+                    <option value="conversions" <?= $eventTypeSelectValue === 'conversions' ? 'selected' : '' ?>>Conversions only</option>
+                    <?php if ($availableEventKeys !== []): ?>
+                    <optgroup label="Specific event">
+                        <?php foreach ($availableEventKeys as $ek): ?>
+                            <?php $ekVal = 'ek:' . $ek; ?>
+                            <option value="<?= htmlspecialchars($ekVal) ?>" <?= $eventTypeSelectValue === $ekVal ? 'selected' : '' ?>>
+                                <?= htmlspecialchars($ek) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </optgroup>
+                    <?php endif; ?>
                 </select>
             </div>
 
@@ -497,7 +524,7 @@ $showingCount = $viewMode === 'cohort' ? count($cohortRows) : min($perPage, coun
 
 <?php if ($viewMode === 'cohort'): ?>
 <div class="card conversion-log-card">
-    <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+            <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
         <div>
             <h2 class="card-title" style="margin: 0;">With click details (<?= number_format(count($cohortRows)) ?>)</h2>
             <p style="margin: 6px 0 0 0; font-size: 13px; color: #666;">
@@ -507,8 +534,12 @@ $showingCount = $viewMode === 'cohort' ? count($cohortRows) : min($perPage, coun
                 <?php endif; ?>
             </p>
         </div>
-        <input type="search" id="cohort-sift-input" placeholder="Search this table…"
-               style="min-width: 220px; padding: 8px 12px; border: 2px solid #ddd; border-radius: 4px;">
+        <div class="conversion-log-col-tools">
+            <input type="search" id="cohort-sift-input" placeholder="Search this table…"
+                   style="min-width: 220px; padding: 8px 12px; border: 2px solid #ddd; border-radius: 4px;">
+            <button type="button" class="btn btn-secondary" id="cohort-columns-btn" aria-expanded="false" aria-controls="cohort-columns-panel">Columns</button>
+            <div class="conversion-log-col-panel" id="cohort-columns-panel" role="dialog" aria-label="Arrange columns"></div>
+        </div>
     </div>
     <div class="card-body">
         <?php if (empty($cohortRows)): ?>
@@ -518,30 +549,24 @@ $showingCount = $viewMode === 'cohort' ? count($cohortRows) : min($perPage, coun
             </div>
         <?php else: ?>
             <div class="conversion-log-table-wrapper table-wrapper">
-                <table class="table conversion-log-table" id="cohort-sift-table">
+                <table class="table conversion-log-table" id="cohort-sift-table" data-col-prefs="cohort">
                     <thead>
                         <tr>
-                            <th class="cohort-sort" data-sort="0" style="cursor: pointer;">Time</th>
-                            <th class="cohort-sort" data-sort="1" style="cursor: pointer;">Click ID</th>
-                            <th class="cohort-sort" data-sort="2" style="cursor: pointer;">Campaign</th>
-                            <th class="cohort-sort" data-sort="3" style="cursor: pointer;">Offer</th>
-                            <th class="cohort-sort" data-sort="4" style="cursor: pointer;">Revenue</th>
-                            <th class="cohort-sort" data-sort="5" style="cursor: pointer;">Country</th>
-                            <th class="cohort-sort" data-sort="6" style="cursor: pointer;">Device</th>
-                            <th class="cohort-sort" data-sort="7" style="cursor: pointer;">OS</th>
-                            <th class="cohort-sort" data-sort="8" style="cursor: pointer;">Browser</th>
-                            <th class="cohort-sort" data-sort="9" style="cursor: pointer;">Click cost</th>
-                            <?php
-                            $cohortExtraStart = 10;
-                            foreach ($visibleExtraCols as $ci => $col):
-                            ?>
-                                <th class="cohort-sort" data-sort="<?= (int) ($cohortExtraStart + $ci) ?>" style="cursor: pointer;"><?= htmlspecialchars($col['label']) ?></th>
+                            <th class="cohort-sort" data-col="time" style="cursor: pointer;">Time</th>
+                            <th class="cohort-sort" data-col="click_id" style="cursor: pointer;">Click ID</th>
+                            <th class="cohort-sort" data-col="campaign" style="cursor: pointer;">Campaign</th>
+                            <th class="cohort-sort" data-col="offer" style="cursor: pointer;">Offer</th>
+                            <th class="cohort-sort" data-col="revenue" style="cursor: pointer;">Revenue</th>
+                            <th class="cohort-sort" data-col="country" style="cursor: pointer;">Country</th>
+                            <th class="cohort-sort" data-col="device" style="cursor: pointer;">Device</th>
+                            <th class="cohort-sort" data-col="os" style="cursor: pointer;">OS</th>
+                            <th class="cohort-sort" data-col="browser" style="cursor: pointer;">Browser</th>
+                            <th class="cohort-sort" data-col="click_cost" style="cursor: pointer;">Click cost</th>
+                            <?php foreach ($visibleExtraCols as $col): ?>
+                                <th class="cohort-sort" data-col="pb:<?= htmlspecialchars($col['key']) ?>" style="cursor: pointer;"><?= htmlspecialchars($col['label']) ?></th>
                             <?php endforeach; ?>
-                            <?php
-                            $tokenStart = $cohortExtraStart + count($visibleExtraCols);
-                            foreach ($clickTokenKeys as $ti => $tokenKey):
-                            ?>
-                                <th class="cohort-sort" data-sort="<?= (int) ($tokenStart + $ti) ?>" style="cursor: pointer;"><?= htmlspecialchars($tokenKey) ?></th>
+                            <?php foreach ($clickTokenKeys as $tokenKey): ?>
+                                <th class="cohort-sort" data-col="tok:<?= htmlspecialchars($tokenKey) ?>" style="cursor: pointer;"><?= htmlspecialchars($tokenKey) ?></th>
                             <?php endforeach; ?>
                         </tr>
                     </thead>
@@ -554,8 +579,8 @@ $showingCount = $viewMode === 'cohort' ? count($cohortRows) : min($perPage, coun
                             $tokens = $conv['click_tokens'] ?? [];
                         ?>
                         <tr class="<?= $rowClass ?>">
-                            <td class="conversion-mono conversion-nowrap" data-sort-value="<?= htmlspecialchars($conv['ts'] ?? '') ?>"><?= htmlspecialchars(Formatter::formatDateTime($conv['ts'], $userTimezone)) ?></td>
-                            <td data-sort-value="<?= htmlspecialchars($conv['click_id']) ?>">
+                            <td data-col="time" class="conversion-mono conversion-nowrap" data-sort-value="<?= htmlspecialchars($conv['ts'] ?? '') ?>"><?= htmlspecialchars(Formatter::formatDateTime($conv['ts'], $userTimezone)) ?></td>
+                            <td data-col="click_id" data-sort-value="<?= htmlspecialchars($conv['click_id']) ?>">
                                 <div class="click-id-row">
                                     <code
                                         class="click-id-copyable conversion-mono"
@@ -567,21 +592,21 @@ $showingCount = $viewMode === 'cohort' ? count($cohortRows) : min($perPage, coun
                                     <?= renderClickLookupLink($conv['click_id']) ?>
                                 </div>
                             </td>
-                            <td data-sort-value="<?= htmlspecialchars($conv['campaign_name'] ?? '') ?>"><strong><?= htmlspecialchars($conv['campaign_name'] ?? '-') ?></strong></td>
-                            <td data-sort-value="<?= htmlspecialchars($conv['offer_name'] ?? '') ?>"><?= htmlspecialchars($conv['offer_name'] ?? '-') ?></td>
-                            <td class="conversion-num" data-sort-value="<?= htmlspecialchars((string) $conv['revenue']) ?>"><?= Formatter::formatCurrency($conv['revenue'], $conv['currency'] ?? $userCurrency) ?></td>
-                            <td data-sort-value="<?= htmlspecialchars($conv['country'] ?? '') ?>"><?= htmlspecialchars($conv['country'] ?? '-') ?></td>
-                            <td data-sort-value="<?= htmlspecialchars($conv['click_device'] ?? '') ?>"><?= htmlspecialchars($conv['click_device'] ?? '-') ?></td>
-                            <td data-sort-value="<?= htmlspecialchars($conv['click_os'] ?? '') ?>"><?= htmlspecialchars($conv['click_os'] ?? '-') ?></td>
-                            <td data-sort-value="<?= htmlspecialchars($conv['click_browser'] ?? '') ?>"><?= htmlspecialchars($conv['click_browser'] ?? '-') ?></td>
-                            <td class="conversion-num" data-sort-value="<?= htmlspecialchars((string) ($conv['click_cost'] ?? '')) ?>"><?= $conv['click_cost'] !== null ? Formatter::formatCurrency($conv['click_cost'], $userCurrency) : '-' ?></td>
+                            <td data-col="campaign" data-sort-value="<?= htmlspecialchars($conv['campaign_name'] ?? '') ?>"><strong><?= htmlspecialchars($conv['campaign_name'] ?? '-') ?></strong></td>
+                            <td data-col="offer" data-sort-value="<?= htmlspecialchars($conv['offer_name'] ?? '') ?>"><?= htmlspecialchars($conv['offer_name'] ?? '-') ?></td>
+                            <td data-col="revenue" class="conversion-num" data-sort-value="<?= htmlspecialchars((string) $conv['revenue']) ?>"><?= Formatter::formatCurrency($conv['revenue'], $conv['currency'] ?? $userCurrency) ?></td>
+                            <td data-col="country" data-sort-value="<?= htmlspecialchars($conv['country'] ?? '') ?>"><?= htmlspecialchars($conv['country'] ?? '-') ?></td>
+                            <td data-col="device" data-sort-value="<?= htmlspecialchars($conv['click_device'] ?? '') ?>"><?= htmlspecialchars($conv['click_device'] ?? '-') ?></td>
+                            <td data-col="os" data-sort-value="<?= htmlspecialchars($conv['click_os'] ?? '') ?>"><?= htmlspecialchars($conv['click_os'] ?? '-') ?></td>
+                            <td data-col="browser" data-sort-value="<?= htmlspecialchars($conv['click_browser'] ?? '') ?>"><?= htmlspecialchars($conv['click_browser'] ?? '-') ?></td>
+                            <td data-col="click_cost" class="conversion-num" data-sort-value="<?= htmlspecialchars((string) ($conv['click_cost'] ?? '')) ?>"><?= $conv['click_cost'] !== null ? Formatter::formatCurrency($conv['click_cost'], $userCurrency) : '-' ?></td>
                             <?php foreach ($visibleExtraCols as $col): ?>
                                 <?php $extraVal = $conv['pb_' . $col['key']] ?? null; ?>
-                                <td class="conversion-mono" data-sort-value="<?= htmlspecialchars((string) ($extraVal ?? '')) ?>"><?= htmlspecialchars($extraVal ?? '-') ?></td>
+                                <td data-col="pb:<?= htmlspecialchars($col['key']) ?>" class="conversion-mono" data-sort-value="<?= htmlspecialchars((string) ($extraVal ?? '')) ?>"><?= htmlspecialchars($extraVal ?? '-') ?></td>
                             <?php endforeach; ?>
                             <?php foreach ($clickTokenKeys as $tokenKey): ?>
                                 <?php $tv = $tokens[$tokenKey] ?? null; ?>
-                                <td class="conversion-mono" data-sort-value="<?= htmlspecialchars((string) ($tv ?? '')) ?>"><?= htmlspecialchars($tv ?? '-') ?></td>
+                                <td data-col="tok:<?= htmlspecialchars($tokenKey) ?>" class="conversion-mono" data-sort-value="<?= htmlspecialchars((string) ($tv ?? '')) ?>"><?= htmlspecialchars($tv ?? '-') ?></td>
                             <?php endforeach; ?>
                         </tr>
                         <?php endforeach; ?>
@@ -606,21 +631,22 @@ $showingCount = $viewMode === 'cohort' ? count($cohortRows) : min($perPage, coun
         });
     });
 
-    let sortCol = -1;
+    let sortColId = null;
     let sortAsc = true;
     table.querySelectorAll('th.cohort-sort').forEach(function (th) {
         th.addEventListener('click', function () {
-            const col = parseInt(th.getAttribute('data-sort'), 10);
-            if (sortCol === col) {
+            const colId = th.getAttribute('data-col');
+            if (!colId) return;
+            if (sortColId === colId) {
                 sortAsc = !sortAsc;
             } else {
-                sortCol = col;
+                sortColId = colId;
                 sortAsc = true;
             }
             const rows = Array.from(tbody.rows);
             rows.sort(function (a, b) {
-                const aCell = a.cells[col];
-                const bCell = b.cells[col];
+                const aCell = Array.prototype.find.call(a.cells, function (c) { return c.getAttribute('data-col') === colId; });
+                const bCell = Array.prototype.find.call(b.cells, function (c) { return c.getAttribute('data-col') === colId; });
                 const aVal = (aCell && aCell.getAttribute('data-sort-value')) || (aCell ? aCell.textContent : '');
                 const bVal = (bCell && bCell.getAttribute('data-sort-value')) || (bCell ? bCell.textContent : '');
                 const aNum = parseFloat(aVal);
@@ -643,7 +669,13 @@ $showingCount = $viewMode === 'cohort' ? count($cohortRows) : min($perPage, coun
 <div class="card conversion-log-card">
     <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
         <h2 class="card-title">Conversions (<?= number_format($totalRows) ?>)</h2>
-        <a href="<?= htmlspecialchars($exportUrl) ?>" class="btn btn-secondary">Export CSV</a>
+        <div class="conversion-log-col-tools">
+            <?php if (!empty($conversions)): ?>
+            <button type="button" class="btn btn-secondary" id="log-columns-btn" aria-expanded="false" aria-controls="log-columns-panel">Columns</button>
+            <div class="conversion-log-col-panel" id="log-columns-panel" role="dialog" aria-label="Arrange columns"></div>
+            <?php endif; ?>
+            <a href="<?= htmlspecialchars($exportUrl) ?>" class="btn btn-secondary">Export CSV</a>
+        </div>
     </div>
     <div class="card-body">
         <?php if (empty($conversions)): ?>
@@ -653,31 +685,31 @@ $showingCount = $viewMode === 'cohort' ? count($cohortRows) : min($perPage, coun
             </div>
         <?php else: ?>
             <div class="conversion-log-table-wrapper table-wrapper">
-                <table class="table conversion-log-table">
+                <table class="table conversion-log-table" id="conversion-log-table" data-col-prefs="log">
                     <thead>
                         <tr>
-                            <th>Conv ID</th>
-                            <th>Time</th>
-                            <th>Click ID</th>
-                            <th>Campaign</th>
-                            <th>Offer</th>
-                            <th>LP</th>
-                            <th>Status</th>
-                            <th>Payout</th>
-                            <th>Value</th>
-                            <th>Revenue</th>
-                            <th>Currency</th>
-                            <th>TXID</th>
-                            <th>Event</th>
-                            <th>Event ID</th>
-                            <th>Traffic Source</th>
-                            <th>Country</th>
-                            <th>City</th>
-                            <th>State</th>
-                            <th>IP</th>
-                            <th>Source</th>
+                            <th data-col="conv_id">Conv ID</th>
+                            <th data-col="time">Time</th>
+                            <th data-col="click_id">Click ID</th>
+                            <th data-col="campaign">Campaign</th>
+                            <th data-col="offer">Offer</th>
+                            <th data-col="lp">LP</th>
+                            <th data-col="status">Status</th>
+                            <th data-col="payout">Payout</th>
+                            <th data-col="value">Value</th>
+                            <th data-col="revenue">Revenue</th>
+                            <th data-col="currency">Currency</th>
+                            <th data-col="txid">TXID</th>
+                            <th data-col="event">Event</th>
+                            <th data-col="event_id">Event ID</th>
+                            <th data-col="traffic_source">Traffic Source</th>
+                            <th data-col="country">Country</th>
+                            <th data-col="city">City</th>
+                            <th data-col="state">State</th>
+                            <th data-col="ip">IP</th>
+                            <th data-col="source">Source</th>
                             <?php foreach ($visibleExtraCols as $col): ?>
-                                <th><?= htmlspecialchars($col['label']) ?></th>
+                                <th data-col="pb:<?= htmlspecialchars($col['key']) ?>"><?= htmlspecialchars($col['label']) ?></th>
                             <?php endforeach; ?>
                         </tr>
                     </thead>
@@ -689,9 +721,9 @@ $showingCount = $viewMode === 'cohort' ? count($cohortRows) : min($perPage, coun
                                 . ($isOptIn ? ' conversion-row-optin' : '');
                         ?>
                         <tr class="<?= $rowClass ?>">
-                            <td class="conversion-mono"><?= (int) $conv['id'] ?></td>
-                            <td class="conversion-mono conversion-nowrap"><?= htmlspecialchars(Formatter::formatDateTime($conv['ts'], $userTimezone)) ?></td>
-                            <td>
+                            <td data-col="conv_id" class="conversion-mono"><?= (int) $conv['id'] ?></td>
+                            <td data-col="time" class="conversion-mono conversion-nowrap"><?= htmlspecialchars(Formatter::formatDateTime($conv['ts'], $userTimezone)) ?></td>
+                            <td data-col="click_id">
                                 <div class="click-id-row">
                                     <code
                                         class="click-id-copyable conversion-mono"
@@ -703,25 +735,25 @@ $showingCount = $viewMode === 'cohort' ? count($cohortRows) : min($perPage, coun
                                     <?= renderClickLookupLink($conv['click_id']) ?>
                                 </div>
                             </td>
-                            <td><strong><?= htmlspecialchars($conv['campaign_name'] ?? '-') ?></strong></td>
-                            <td><?= htmlspecialchars($conv['offer_name'] ?? '-') ?></td>
-                            <td><?= htmlspecialchars($conv['landing_page_name'] ?? '-') ?></td>
-                            <td><?= renderConversionStatusBadge($conv['status'] ?? 'pending') ?></td>
-                            <td class="conversion-num"><?= $conv['payout'] !== null ? Formatter::formatCurrency($conv['payout'], $conv['currency'] ?? $userCurrency) : '-' ?></td>
-                            <td class="conversion-num"><?= $conv['value'] !== null ? Formatter::formatCurrency($conv['value'], $conv['currency'] ?? $userCurrency) : '-' ?></td>
-                            <td class="conversion-num conversion-revenue"><?= Formatter::formatCurrency($conv['revenue'], $conv['currency'] ?? $userCurrency) ?></td>
-                            <td class="conversion-mono"><?= htmlspecialchars($conv['currency'] ?? '-') ?></td>
-                            <td class="conversion-mono"><?= htmlspecialchars($conv['txid'] ?? '-') ?></td>
-                            <td><?= renderConversionEventCell($conv['event_key'] ?? null) ?></td>
-                            <td class="conversion-mono"><?= htmlspecialchars($conv['event_id'] ?? '-') ?></td>
-                            <td><?= htmlspecialchars($conv['traffic_source_name'] ?? '-') ?></td>
-                            <td><?= htmlspecialchars($conv['country'] ?? '-') ?></td>
-                            <td><?= htmlspecialchars($conv['city'] ?? '-') ?></td>
-                            <td><?= htmlspecialchars($conv['region'] ?? '-') ?></td>
-                            <td class="conversion-mono"><?= htmlspecialchars($conv['ip'] ?? '-') ?></td>
-                            <td><?= htmlspecialchars($conv['source'] ?? '-') ?></td>
+                            <td data-col="campaign"><strong><?= htmlspecialchars($conv['campaign_name'] ?? '-') ?></strong></td>
+                            <td data-col="offer"><?= htmlspecialchars($conv['offer_name'] ?? '-') ?></td>
+                            <td data-col="lp"><?= htmlspecialchars($conv['landing_page_name'] ?? '-') ?></td>
+                            <td data-col="status"><?= renderConversionStatusBadge($conv['status'] ?? 'pending') ?></td>
+                            <td data-col="payout" class="conversion-num"><?= $conv['payout'] !== null ? Formatter::formatCurrency($conv['payout'], $conv['currency'] ?? $userCurrency) : '-' ?></td>
+                            <td data-col="value" class="conversion-num"><?= $conv['value'] !== null ? Formatter::formatCurrency($conv['value'], $conv['currency'] ?? $userCurrency) : '-' ?></td>
+                            <td data-col="revenue" class="conversion-num conversion-revenue"><?= Formatter::formatCurrency($conv['revenue'], $conv['currency'] ?? $userCurrency) ?></td>
+                            <td data-col="currency" class="conversion-mono"><?= htmlspecialchars($conv['currency'] ?? '-') ?></td>
+                            <td data-col="txid" class="conversion-mono"><?= htmlspecialchars($conv['txid'] ?? '-') ?></td>
+                            <td data-col="event"><?= renderConversionEventCell($conv['event_key'] ?? null) ?></td>
+                            <td data-col="event_id" class="conversion-mono"><?= htmlspecialchars($conv['event_id'] ?? '-') ?></td>
+                            <td data-col="traffic_source"><?= htmlspecialchars($conv['traffic_source_name'] ?? '-') ?></td>
+                            <td data-col="country"><?= htmlspecialchars($conv['country'] ?? '-') ?></td>
+                            <td data-col="city"><?= htmlspecialchars($conv['city'] ?? '-') ?></td>
+                            <td data-col="state"><?= htmlspecialchars($conv['region'] ?? '-') ?></td>
+                            <td data-col="ip" class="conversion-mono"><?= htmlspecialchars($conv['ip'] ?? '-') ?></td>
+                            <td data-col="source"><?= htmlspecialchars($conv['source'] ?? '-') ?></td>
                             <?php foreach ($visibleExtraCols as $col): ?>
-                                <td class="conversion-mono"><?= htmlspecialchars($conv['pb_' . $col['key']] ?? '-') ?></td>
+                                <td data-col="pb:<?= htmlspecialchars($col['key']) ?>" class="conversion-mono"><?= htmlspecialchars($conv['pb_' . $col['key']] ?? '-') ?></td>
                             <?php endforeach; ?>
                         </tr>
                         <?php endforeach; ?>
@@ -801,4 +833,261 @@ function copyClickId(element) {
         });
     }
 }
+
+(function initConversionLogColumnPrefs() {
+    var STORAGE_PREFIX = 'simplekuma.conversionLog.columns.v1.';
+
+    function loadPrefs(scope, defaultOrder) {
+        var order = defaultOrder.slice();
+        var hidden = [];
+        try {
+            var raw = localStorage.getItem(STORAGE_PREFIX + scope);
+            if (!raw) {
+                return { order: order, hidden: hidden };
+            }
+            var parsed = JSON.parse(raw);
+            if (parsed && Array.isArray(parsed.order)) {
+                var seen = {};
+                var merged = [];
+                parsed.order.forEach(function (id) {
+                    if (typeof id === 'string' && defaultOrder.indexOf(id) !== -1 && !seen[id]) {
+                        merged.push(id);
+                        seen[id] = true;
+                    }
+                });
+                defaultOrder.forEach(function (id) {
+                    if (!seen[id]) {
+                        merged.push(id);
+                    }
+                });
+                order = merged;
+            }
+            if (parsed && Array.isArray(parsed.hidden)) {
+                hidden = parsed.hidden.filter(function (id) {
+                    return typeof id === 'string' && defaultOrder.indexOf(id) !== -1;
+                });
+            }
+        } catch (e) { /* ignore corrupt prefs */ }
+        return { order: order, hidden: hidden };
+    }
+
+    function savePrefs(scope, prefs) {
+        try {
+            localStorage.setItem(STORAGE_PREFIX + scope, JSON.stringify({
+                order: prefs.order,
+                hidden: prefs.hidden
+            }));
+        } catch (e) { /* private mode / quota */ }
+    }
+
+    function cellByCol(row, colId) {
+        return Array.prototype.find.call(row.cells, function (c) {
+            return c.getAttribute('data-col') === colId;
+        }) || null;
+    }
+
+    function applyLayout(table, prefs) {
+        var headRow = table.tHead && table.tHead.rows[0];
+        if (!headRow) return;
+        var hiddenSet = {};
+        prefs.hidden.forEach(function (id) { hiddenSet[id] = true; });
+
+        var thByCol = {};
+        Array.prototype.forEach.call(headRow.cells, function (th) {
+            var id = th.getAttribute('data-col');
+            if (id) thByCol[id] = th;
+        });
+
+        prefs.order.forEach(function (colId) {
+            var th = thByCol[colId];
+            if (!th) return;
+            headRow.appendChild(th);
+            if (hiddenSet[colId]) {
+                th.classList.add('col-pref-hidden');
+            } else {
+                th.classList.remove('col-pref-hidden');
+            }
+        });
+
+        Array.prototype.forEach.call(table.tBodies[0].rows, function (row) {
+            prefs.order.forEach(function (colId) {
+                var td = cellByCol(row, colId);
+                if (!td) return;
+                row.appendChild(td);
+                if (hiddenSet[colId]) {
+                    td.classList.add('col-pref-hidden');
+                } else {
+                    td.classList.remove('col-pref-hidden');
+                }
+            });
+        });
+    }
+
+    function renderPanel(panel, table, scope, prefs, defaultOrder) {
+        panel.innerHTML = '';
+        var title = document.createElement('p');
+        title.className = 'conversion-log-col-panel-title';
+        title.textContent = 'Columns';
+        panel.appendChild(title);
+
+        var hint = document.createElement('p');
+        hint.className = 'conversion-log-col-panel-hint';
+        hint.textContent = 'Show or hide columns and move them left/right. Saved in this browser only. CSV export still includes all columns.';
+        panel.appendChild(hint);
+
+        var list = document.createElement('ul');
+        list.className = 'conversion-log-col-list';
+
+        prefs.order.forEach(function (colId, index) {
+            var th = Array.prototype.find.call(table.tHead.rows[0].cells, function (c) {
+                return c.getAttribute('data-col') === colId;
+            });
+            var labelText = th ? (th.textContent || colId).trim() : colId;
+            var li = document.createElement('li');
+
+            var label = document.createElement('label');
+            var cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = prefs.hidden.indexOf(colId) === -1;
+            cb.addEventListener('change', function () {
+                if (cb.checked) {
+                    prefs.hidden = prefs.hidden.filter(function (id) { return id !== colId; });
+                } else if (prefs.hidden.indexOf(colId) === -1) {
+                    prefs.hidden.push(colId);
+                }
+                savePrefs(scope, prefs);
+                applyLayout(table, prefs);
+            });
+            var span = document.createElement('span');
+            span.textContent = labelText;
+            span.title = labelText;
+            label.appendChild(cb);
+            label.appendChild(span);
+            li.appendChild(label);
+
+            var move = document.createElement('div');
+            move.className = 'conversion-log-col-move';
+
+            var up = document.createElement('button');
+            up.type = 'button';
+            up.className = 'btn btn-outline';
+            up.textContent = '↑';
+            up.title = 'Move left';
+            up.disabled = index === 0;
+            up.addEventListener('click', function () {
+                if (index === 0) return;
+                var tmp = prefs.order[index - 1];
+                prefs.order[index - 1] = prefs.order[index];
+                prefs.order[index] = tmp;
+                savePrefs(scope, prefs);
+                applyLayout(table, prefs);
+                renderPanel(panel, table, scope, prefs, defaultOrder);
+            });
+
+            var down = document.createElement('button');
+            down.type = 'button';
+            down.className = 'btn btn-outline';
+            down.textContent = '↓';
+            down.title = 'Move right';
+            down.disabled = index === prefs.order.length - 1;
+            down.addEventListener('click', function () {
+                if (index >= prefs.order.length - 1) return;
+                var tmp = prefs.order[index + 1];
+                prefs.order[index + 1] = prefs.order[index];
+                prefs.order[index] = tmp;
+                savePrefs(scope, prefs);
+                applyLayout(table, prefs);
+                renderPanel(panel, table, scope, prefs, defaultOrder);
+            });
+
+            move.appendChild(up);
+            move.appendChild(down);
+            li.appendChild(move);
+            list.appendChild(li);
+        });
+        panel.appendChild(list);
+
+        var actions = document.createElement('div');
+        actions.className = 'conversion-log-col-actions';
+
+        var showAll = document.createElement('button');
+        showAll.type = 'button';
+        showAll.className = 'btn btn-outline';
+        showAll.textContent = 'Show all';
+        showAll.addEventListener('click', function () {
+            prefs.hidden = [];
+            savePrefs(scope, prefs);
+            applyLayout(table, prefs);
+            renderPanel(panel, table, scope, prefs, defaultOrder);
+        });
+
+        var reset = document.createElement('button');
+        reset.type = 'button';
+        reset.className = 'btn btn-outline';
+        reset.textContent = 'Reset order';
+        reset.addEventListener('click', function () {
+            prefs.order = defaultOrder.slice();
+            prefs.hidden = [];
+            savePrefs(scope, prefs);
+            applyLayout(table, prefs);
+            renderPanel(panel, table, scope, prefs, defaultOrder);
+        });
+
+        actions.appendChild(showAll);
+        actions.appendChild(reset);
+        panel.appendChild(actions);
+    }
+
+    function bindTable(table, btn, panel) {
+        if (!table || !btn || !panel) return;
+        var scope = table.getAttribute('data-col-prefs') || 'log';
+        var defaultOrder = Array.prototype.map.call(table.tHead.rows[0].cells, function (th) {
+            return th.getAttribute('data-col');
+        }).filter(Boolean);
+        if (defaultOrder.length === 0) return;
+
+        var prefs = loadPrefs(scope, defaultOrder);
+        applyLayout(table, prefs);
+        renderPanel(panel, table, scope, prefs, defaultOrder);
+
+        btn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            var open = !panel.classList.contains('is-open');
+            document.querySelectorAll('.conversion-log-col-panel.is-open').forEach(function (p) {
+                p.classList.remove('is-open');
+            });
+            document.querySelectorAll('[aria-controls$="-columns-panel"]').forEach(function (b) {
+                b.setAttribute('aria-expanded', 'false');
+            });
+            if (open) {
+                panel.classList.add('is-open');
+                btn.setAttribute('aria-expanded', 'true');
+            }
+        });
+
+        panel.addEventListener('click', function (e) {
+            e.stopPropagation();
+        });
+    }
+
+    document.addEventListener('click', function () {
+        document.querySelectorAll('.conversion-log-col-panel.is-open').forEach(function (p) {
+            p.classList.remove('is-open');
+        });
+        document.querySelectorAll('[aria-controls$="-columns-panel"]').forEach(function (b) {
+            b.setAttribute('aria-expanded', 'false');
+        });
+    });
+
+    bindTable(
+        document.getElementById('conversion-log-table'),
+        document.getElementById('log-columns-btn'),
+        document.getElementById('log-columns-panel')
+    );
+    bindTable(
+        document.getElementById('cohort-sift-table'),
+        document.getElementById('cohort-columns-btn'),
+        document.getElementById('cohort-columns-panel')
+    );
+})();
 </script>

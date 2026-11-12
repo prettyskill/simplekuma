@@ -232,6 +232,10 @@ try {
             $sort = trim((string)($_GET['sort'] ?? 'clicks'));
             $order = trim((string)($_GET['order'] ?? 'desc'));
             $metaDelivery = (string)($_GET['meta_delivery'] ?? '') === '1';
+            $layout = strtolower(trim((string)($_GET['layout'] ?? 'nested'))) === 'flat' ? 'flat' : 'nested';
+            if ($layout === 'flat') {
+                $parentPath = [];
+            }
 
             $cacheParts['dimensions'] = $dimensions;
             $cacheParts['parent_path'] = $parentPath;
@@ -240,6 +244,7 @@ try {
             $cacheParts['sort'] = $sort;
             $cacheParts['order'] = $order;
             $cacheParts['meta_delivery'] = $metaDelivery ? 1 : 0;
+            $cacheParts['layout'] = $layout;
 
             $cacheKey = CampaignStatsResponseCache::makeKey($userId, 'breakdown', $cacheParts);
             $payload = CampaignStatsResponseCache::remember($cacheKey, static function () use (
@@ -255,7 +260,8 @@ try {
                 $sort,
                 $order,
                 $filters,
-                $metaDelivery
+                $metaDelivery,
+                $layout
             ) {
                 return ReportingConcurrencyGuard::run(static function () use (
                     $service,
@@ -270,7 +276,8 @@ try {
                     $sort,
                     $order,
                     $filters,
-                    $metaDelivery
+                    $metaDelivery,
+                    $layout
                 ) {
                     return $service->getBreakdown(
                         $campaignId,
@@ -284,7 +291,8 @@ try {
                         $sort,
                         $order,
                         $filters,
-                        $metaDelivery
+                        $metaDelivery,
+                        $layout
                     );
                 });
             }, StatsResponseCache::TTL_BREAKDOWN);

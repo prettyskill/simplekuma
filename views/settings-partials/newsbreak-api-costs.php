@@ -16,7 +16,8 @@ $nbList = $allNewsBreakIntegrations ?? [];
                     Pulls campaign spend hourly from NewsBreak <code>getIntegratedReport</code> (cost is converted from cents).
                     Create a NewsBreak traffic source from template so clicks store <code>__CAMPAIGN_ID__</code> and
                     <code>__CALLBACK_PARAM__</code>. Generate an Access Token in NewsBreak Ad Manager → Resources → API Access Tokens.
-                    Conversion postbacks use the traffic source postback URL (edit <code>event_type</code> to match Event Management).
+                    Conversion postbacks: use Settings → Integrations → Custom Postbacks
+                    (or the default stored when you create NewsBreak from the traffic source template; edit <code>event_type</code> to match Event Management).
                 </p>
             </div>
 

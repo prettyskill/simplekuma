@@ -4,6 +4,54 @@
 
 ---
 
+# Simple Kuma Tracker Version 1.1.5.36
+
+## Changes in 1.1.5.36
+
+### Optee / Simple Kuma join — verified
+- Live smoke confirmed Optee ↔ Kuma zone merge with zone field `zoneid` (Simple Kuma Visits/Clicks match Campaign Stats on matching zones)
+- Reminder: use **1.1.5.35+**, Save tracker after Test Connection, set zone field to the campaign token (e.g. `zoneid`), link the correct tracker campaign
+
+### Campaigns list: global search
+- Search filters the **full** campaign set (name / tag / `#id` / source / group / flow / status / key) **before** pagination
+- Query preserved as `campaigns_q` across sort, Show 25/50/All, date/status Apply, and paging
+
+### Campaigns list: copy tracking link
+- Per-row **Copy link** (desktop 🔗 + mobile) copies the default campaign tracking URL without opening Edit
+- Brief “Copied” feedback
+
+### Conversion Log: arrange / show-hide columns
+- **Columns** control: toggle visibility and move columns left/right (prefs in this browser)
+- CSV export still includes the full column set
+
+### Settings: conversion event allowlist
+- Global **Events that count as Conversions / CR** (Data Retention / Privacy): empty = legacy; filled = only listed `event_key` values bump Conversions, CR, and revenue
+- Opt-ins stay on the Opt-ins KPI; Conversion Log “Conversions only” remains non-opt-in filter (not the allowlist)
+- New postbacks honor the allowlist immediately; rebuild daily summaries to reclassify historical KPI totals
+
+### Perf: hot-path schema probes
+- **SchemaProbe** file cache for hosts without APCu; remaining click/conversion/postback probes routed through SchemaProbe; flushed after migrations
+
+### Campaigns list: Profit column
+- Profit between Revenue and ROI (desktop + mobile + group totals), sortable
+
+### Campaigns list: global metric sort + page size
+- Metric headers sort the **full** filtered set before pagination; **Show** 25 / 50 / **All**
+
+### Visitor Log: traffic-source token columns
+- Dynamic traffic-source / custom token columns (same bags as Conversion Log); desktop table matches Conversion Log spreadsheet chrome
+
+### Campaign editor: dual-path LP click URL
+- CTA Step 2 documents **Option A** (`kTrack()`) and **Option B** (`/lp/click.php?click_id=…`) side by side — both supported
+
+### Conversion Log: filter by individual event
+- Event type filter lists distinct `event_key` values for the current window under Specific event
+
+### Campaign Stats: flat / horizontal breakdown layout
+- Breakdown **Layout**: Nested or Flat table; CSV + saved views include layout
+
+---
+
 # Simple Kuma Tracker Version 1.1.5.35
 
 ## Changes in 1.1.5.35

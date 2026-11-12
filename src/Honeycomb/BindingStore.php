@@ -6,6 +6,7 @@ namespace SimpleKuma\Honeycomb;
 
 use mysqli;
 use RuntimeException;
+use SimpleKuma\Database\SchemaProbe;
 
 /**
  * Links Kuma campaigns to remote addon account/campaign IDs (campaign_addon_bindings).
@@ -18,8 +19,7 @@ final class BindingStore
 
     public function tableExists(): bool
     {
-        $result = $this->db->query("SHOW TABLES LIKE 'campaign_addon_bindings'");
-        return $result !== false && $result->num_rows > 0;
+        return SchemaProbe::tableExists($this->db, 'campaign_addon_bindings');
     }
 
     /**

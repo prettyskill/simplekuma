@@ -412,7 +412,7 @@ class CampaignStatsBreakdownService
             FROM {$clicksTable} cl
             INNER JOIN campaigns cp ON cl.campaign_id = cp.id
             LEFT JOIN traffic_sources ts ON cp.traffic_source_id = ts.id
-            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable) . "
+            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable, true, $this->db) . "
             {$fbJoins}
             WHERE cl.campaign_id = ? AND cl.ts >= ? AND cl.ts <= ?{$includedSql}
             GROUP BY {$dayExpr}
@@ -492,7 +492,7 @@ class CampaignStatsBreakdownService
             FROM {$clicksTable} cl
             INNER JOIN campaigns cp ON cl.campaign_id = cp.id
             LEFT JOIN traffic_sources ts ON cp.traffic_source_id = ts.id
-            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable) . "
+            " . CampaignStatsExpressions::conversionsAggJoin('cl', $clicksTable, true, $this->db) . "
             {$joinOffer}
             {$joinLp}
             {$fbJoins}

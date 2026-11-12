@@ -29,7 +29,7 @@ final class VisitorLogQueryService
      *   page?: int,
      *   per_page?: int
      * } $opts
-     * @return array{rows: list<array<string, mixed>>, total: int}
+     * @return array{rows: list<array<string, mixed>>, total: int, click_token_keys: list<string>}
      */
     public function list(array $opts): array
     {
@@ -39,7 +39,8 @@ final class VisitorLogQueryService
         $hasConversion = $opts['has_conversion'] ?? null;
         $excludeFb = !empty($opts['exclude_fb_approval']);
         $page = max(1, (int) ($opts['page'] ?? 1));
-        $perPage = max(1, min(200, (int) ($opts['per_page'] ?? 50)));
+        // Export may request a larger page; UI stays at ≤200.
+        $perPage = max(1, min(5000, (int) ($opts['per_page'] ?? 50)));
         $offset = ($page - 1) * $perPage;
 
         $clickedOnly = ($hasConversion === 'clicked' || $hasConversion === 2);
@@ -49,17 +50,27 @@ final class VisitorLogQueryService
             ? $this->countConvertedClicks($filter)
             : $this->countClicks($filter);
         if ($total === 0) {
-            return ['rows' => [], 'total' => 0];
+            return ['rows' => [], 'total' => 0, 'click_token_keys' => []];
         }
 
         $ids = $conversionOnly
             ? $this->pageConvertedIds($filter, $perPage, $offset)
             : $this->pageIds($filter, $perPage, $offset);
         if ($ids === []) {
-            return ['rows' => [], 'total' => $total];
+            return ['rows' => [], 'total' => $total, 'click_token_keys' => []];
         }
 
-        return ['rows' => $this->hydrateRows($ids), 'total' => $total];
+        $rows = $this->hydrateRows($ids);
+        $tokenKeySet = [];
+        foreach ($rows as $row) {
+            foreach (array_keys($row['click_tokens'] ?? []) as $tk) {
+                $tokenKeySet[$tk] = true;
+            }
+        }
+        $clickTokenKeys = array_keys($tokenKeySet);
+        sort($clickTokenKeys);
+
+        return ['rows' => $rows, 'total' => $total, 'click_token_keys' => $clickTokenKeys];
     }
 
     /**
@@ -242,6 +253,7 @@ final class VisitorLogQueryService
                 cl.click_id,
                 cl.ts,
                 cl.ip,
+                cl.country,
                 cl.city,
                 cl.region,
                 cl.device,
@@ -291,6 +303,9 @@ final class VisitorLogQueryService
                 continue;
             }
             $seen[$id] = true;
+            $row['click_tokens'] = ConversionsQueryService::extractClickTokens(
+                isset($row['extra_json']) ? (string) $row['extra_json'] : null
+            );
             $rows[] = $row;
         }
         $stmt->close();

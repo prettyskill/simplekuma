@@ -22,9 +22,9 @@ function isMobileDevice(): bool {
     return false;
 }
 
-function visitorRowClass(array $click): string
+function visitorRowClass(array $click, int $index = 0): string
 {
-    $class = 'visitor-row';
+    $class = ($index % 2 === 0 ? 'conversion-row-even' : 'conversion-row-odd') . ' visitor-row';
     if (!empty($click['has_conversion'])) {
         return $class . ' visitor-row--converted';
     }
@@ -32,6 +32,47 @@ function visitorRowClass(array $click): string
         return $class . ' visitor-row--clicked';
     }
     return $class;
+}
+
+function visitorDeviceLabel(array $click): string
+{
+    $deviceParts = [];
+    if (!empty($click['device_brand']) && !empty($click['device_model'])) {
+        $deviceParts[] = $click['device_brand'] . ' ' . $click['device_model'];
+    } elseif (!empty($click['device_brand'])) {
+        $deviceParts[] = $click['device_brand'];
+    } elseif (!empty($click['device'])) {
+        $deviceParts[] = $click['device'];
+    }
+
+    $osParts = [];
+    if (!empty($click['os'])) {
+        $osParts[] = $click['os'];
+        if (!empty($click['os_version'])) {
+            $osParts[] = $click['os_version'];
+        }
+    }
+
+    $browserParts = [];
+    if (!empty($click['browser'])) {
+        $browserParts[] = $click['browser'];
+        if (!empty($click['browser_version'])) {
+            $browserParts[] = $click['browser_version'];
+        }
+    }
+
+    $display = [];
+    if ($deviceParts !== []) {
+        $display[] = implode(' ', $deviceParts);
+    }
+    if ($osParts !== []) {
+        $display[] = implode(' ', $osParts);
+    }
+    if ($browserParts !== []) {
+        $display[] = implode(' ', $browserParts);
+    }
+
+    return implode(' / ', $display) ?: 'Unknown';
 }
 
 function renderClickLookupLink(string $clickId): string {
@@ -103,7 +144,8 @@ $visitorPage = $visitorLog->list([
 ]);
 $clicks = $visitorPage['rows'];
 $totalRows = $visitorPage['total'];
-$totalPages = (int) ceil($totalRows / $perPage);
+$clickTokenKeys = $visitorPage['click_token_keys'] ?? [];
+$totalPages = (int) ceil($totalRows / max(1, $perPage));
 
 // Get campaigns for filter
 $campaigns = $db->query("SELECT id, name FROM campaigns ORDER BY name")->fetch_all(MYSQLI_ASSOC);
@@ -394,176 +436,117 @@ function setVisitorDate(preset) {
 <?php endif; ?>
 
 <!-- Visitor Table -->
-<div class="card">
-    <div class="card-header">
+<div class="card conversion-log-card">
+    <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
         <h2 class="card-title">Click Events (<?= number_format($totalRows) ?>)</h2>
-        <a href="?page=visitors&export=csv&<?= http_build_query($_GET) ?>" class="btn btn-secondary">📥 Export CSV</a>
+        <a href="?page=visitors&export=csv&<?= http_build_query($_GET) ?>" class="btn btn-secondary">Export CSV</a>
     </div>
     <div class="card-body">
         <?php if (empty($clicks)): ?>
             <div style="text-align: center; padding: 60px; color: #999;">
-                <div style="font-size: 64px; margin-bottom: 16px;">📭</div>
+                <img src="<?= ASSETS_BASE_URL ?>/assets/images/visitorslog.png" alt="" width="64" height="64" style="margin-bottom: 16px; opacity: 0.5;">
                 <p>No click events found for the selected filters.</p>
             </div>
         <?php else: ?>
             <!-- Desktop Table View (hidden on mobile) -->
-            <div class="table-wrapper desktop-only">
-                <table class="table">
-                        <thead>
-                            <tr>
-                                <th style="width: 70px; text-align: center;">CLICKED</th>
-                                <th style="width: 70px; text-align: center;">CONV</th>
-                                <th>TIMESTAMP</th>
-                                <th>CLICK ID</th>
-                                <th>CAMPAIGN</th>
-                                <th>LANDING PAGE</th>
-                                <th>OFFER</th>
-                                <th>CITY</th>
-                                <th>STATE</th>
-                                <th>DEVICE</th>
-                                <th>IP</th>
-                                <th>TRAFFIC SOURCE</th>
-                                <th>REVENUE</th>
-                            </tr>
-                        </thead>
+            <div class="conversion-log-table-wrapper table-wrapper desktop-only">
+                <table class="table conversion-log-table visitor-log-table">
+                    <thead>
+                        <tr>
+                            <th>Clicked</th>
+                            <th>Conv</th>
+                            <th>Time</th>
+                            <th>Click ID</th>
+                            <th>Campaign</th>
+                            <th>LP</th>
+                            <th>Offer</th>
+                            <th>City</th>
+                            <th>State</th>
+                            <th>Device</th>
+                            <th>IP</th>
+                            <th>Traffic Source</th>
+                            <?php foreach ($clickTokenKeys as $tokenKey): ?>
+                            <th><?= htmlspecialchars($tokenKey) ?></th>
+                            <?php endforeach; ?>
+                            <th>Revenue</th>
+                        </tr>
+                    </thead>
                     <tbody>
-                        <?php foreach ($clicks as $click): ?>
-                        <tr class="<?= visitorRowClass($click) ?>">
-                            <td style="text-align: center;">
+                        <?php foreach ($clicks as $index => $click): ?>
+                        <?php
+                            $clickTokens = $click['click_tokens'] ?? [];
+                            $deviceLabel = visitorDeviceLabel($click);
+                            $guardExtra = json_decode($click['extra_json'] ?? '{}', true) ?? [];
+                            $extraJson = $guardExtra;
+                        ?>
+                        <tr class="<?= visitorRowClass($click, $index) ?>">
+                            <td class="visitor-status-cell">
                                 <?php if ($click['lp_click']): ?>
-                                    <img src="<?= ASSETS_BASE_URL ?>/assets/images/clickbear.png" alt="Clicked" style="width: 36px; height: 36px;" title="Clicked through LP">
+                                    <img src="<?= ASSETS_BASE_URL ?>/assets/images/clickbear.png" alt="Clicked" class="visitor-status-icon" title="Clicked through LP">
                                 <?php else: ?>
-                                    <span class="visitor-empty" aria-hidden="true">—</span>
+                                    <span class="visitor-empty">—</span>
                                 <?php endif; ?>
                             </td>
-                            <td style="text-align: center;">
+                            <td class="visitor-status-cell">
                                 <?php if ($click['has_conversion']): ?>
-                                    <img src="<?= ASSETS_BASE_URL ?>/assets/images/conversionbear.png" alt="Converted" style="width: 36px; height: 36px;" title="Converted">
+                                    <img src="<?= ASSETS_BASE_URL ?>/assets/images/conversionbear.png" alt="Converted" class="visitor-status-icon" title="Converted">
                                 <?php else: ?>
-                                    <span class="visitor-empty" aria-hidden="true">—</span>
+                                    <span class="visitor-empty">—</span>
                                 <?php endif; ?>
                             </td>
-                            <td style="white-space: nowrap; font-family: monospace; font-size: 12px;">
-                                <?= Formatter::formatDateTime($click['ts'], $userTimezone) ?>
-                            </td>
+                            <td class="conversion-mono conversion-nowrap"><?= htmlspecialchars(Formatter::formatDateTime($click['ts'], $userTimezone)) ?></td>
                             <td>
                                 <div class="click-id-row">
-                                    <code 
-                                        class="click-id-copyable" 
+                                    <code
+                                        class="click-id-copyable conversion-mono"
                                         data-click-id="<?= htmlspecialchars($click['click_id']) ?>"
                                         onclick="copyClickId(this)"
-                                        style="font-size: 11px; padding: 6px 10px; overflow: hidden; text-overflow: ellipsis; cursor: pointer; user-select: none; transition: background 0.2s, color 0.2s; font-family: 'Courier New', monospace; color: #333; white-space: nowrap; display: block;"
                                         title="Click to copy: <?= htmlspecialchars($click['click_id']) ?>">
                                         <?= htmlspecialchars($click['click_id']) ?>
                                     </code>
                                     <?= renderClickLookupLink($click['click_id']) ?>
                                 </div>
                             </td>
-                            <td><strong><?= htmlspecialchars($click['campaign_name']) ?></strong></td>
-                            <td><?= htmlspecialchars($click['landing_page_name'] ?? '-') ?><?php
-                                $guardExtra = json_decode($click['extra_json'] ?? '{}', true) ?? [];
-                                if (($guardExtra['emergency_bypass'] ?? '') === 'lp') {
-                                    echo '<div style="font-size: 11px; font-weight: 600;">Emergency bypassed</div>';
-                                }
-                            ?></td>
+                            <td><strong><?= htmlspecialchars($click['campaign_name'] ?? '-') ?></strong></td>
                             <td>
-                                <?php
-                                $extraJson = json_decode($click['extra_json'] ?? '{}', true) ?? [];
-                                if (!empty($extraJson['redirect_rule_matched'])) {
-                                    echo '<span style="color: #d32f2f; font-weight: 600;">Redirect Profile Matched</span>';
-                                } else {
-                                    echo htmlspecialchars($click['offer_name'] ?? '-');
-                                }
-                                ?>
-                            </td>
-                            <td>
-                                <?php if ($click['city']): ?>
-                                    <?= htmlspecialchars($click['city']) ?>
-                                <?php else: ?>
-                                    <span style="color: #999;">-</span>
+                                <?= htmlspecialchars($click['landing_page_name'] ?? '-') ?>
+                                <?php if (($guardExtra['emergency_bypass'] ?? '') === 'lp'): ?>
+                                    <div class="visitor-inline-note">Emergency bypassed</div>
                                 <?php endif; ?>
                             </td>
                             <td>
-                                <?php if ($click['region']): ?>
-                                    <?= htmlspecialchars($click['region']) ?>
+                                <?php if (!empty($extraJson['redirect_rule_matched'])): ?>
+                                    <span class="visitor-inline-warn">Redirect Profile Matched</span>
                                 <?php else: ?>
-                                    <span style="color: #999;">-</span>
+                                    <?= htmlspecialchars($click['offer_name'] ?? '-') ?>
                                 <?php endif; ?>
                             </td>
-                            <td>
-                                <span style="font-size: 12px;" title="<?= htmlspecialchars(
-                                    ($click['device_brand'] ? $click['device_brand'] . ' ' : '') .
-                                    ($click['device_model'] ? $click['device_model'] . ' / ' : '') .
-                                    ($click['os'] ?? 'Unknown') . 
-                                    ($click['os_version'] ? ' ' . $click['os_version'] : '') . 
-                                    ' / ' . 
-                                    ($click['browser'] ?? 'Unknown') .
-                                    ($click['browser_version'] ? ' ' . $click['browser_version'] : '')
-                                ) ?>">
-                                    <?php
-                                    // Display device info with new fields if available
-                                    $deviceParts = [];
-                                    if (!empty($click['device_brand']) && !empty($click['device_model'])) {
-                                        $deviceParts[] = $click['device_brand'] . ' ' . $click['device_model'];
-                                    } elseif (!empty($click['device_brand'])) {
-                                        $deviceParts[] = $click['device_brand'];
-                                    } elseif (!empty($click['device'])) {
-                                        $deviceParts[] = $click['device'];
-                                    }
-                                    
-                                    $osParts = [];
-                                    if (!empty($click['os'])) {
-                                        $osParts[] = $click['os'];
-                                        if (!empty($click['os_version'])) {
-                                            $osParts[] = $click['os_version'];
-                                        }
-                                    }
-                                    
-                                    $browserParts = [];
-                                    if (!empty($click['browser'])) {
-                                        $browserParts[] = $click['browser'];
-                                        if (!empty($click['browser_version'])) {
-                                            $browserParts[] = $click['browser_version'];
-                                        }
-                                    }
-                                    
-                                    $display = [];
-                                    if (!empty($deviceParts)) {
-                                        $display[] = implode(' ', $deviceParts);
-                                    }
-                                    if (!empty($osParts)) {
-                                        $display[] = implode(' ', $osParts);
-                                    }
-                                    if (!empty($browserParts)) {
-                                        $display[] = implode(' ', $browserParts);
-                                    }
-                                    
-                                    echo htmlspecialchars(implode(' / ', $display) ?: 'Unknown');
-                                    ?>
-                                </span>
-                            </td>
-                            <td style="font-family: monospace; font-size: 11px;">
-                                <span class="visitor-ip-cell" style="display:inline-flex; align-items:center; gap:6px;">
-                                    <span><?= htmlspecialchars($click['ip']) ?></span>
+                            <td><?= htmlspecialchars($click['city'] ?? '-') ?></td>
+                            <td><?= htmlspecialchars($click['region'] ?? '-') ?></td>
+                            <td title="<?= htmlspecialchars($deviceLabel) ?>"><?= htmlspecialchars($deviceLabel) ?></td>
+                            <td class="conversion-mono">
+                                <span class="visitor-ip-cell">
+                                    <span><?= htmlspecialchars($click['ip'] ?? '-') ?></span>
                                     <?php if (!empty($click['ip'])): ?>
                                     <button type="button"
                                             class="btn btn-secondary btn-sm visitor-hide-ip-btn"
                                             data-ip="<?= htmlspecialchars($click['ip'], ENT_QUOTES, 'UTF-8') ?>"
-                                            title="Hide this IP from all stats views (does not block traffic)"
-                                            style="padding:2px 6px; font-size:10px; line-height:1.2;">
+                                            title="Hide this IP from all stats views (does not block traffic)">
                                         Hide
                                     </button>
                                     <?php endif; ?>
                                 </span>
                             </td>
-                            <td style="font-size: 13px;">
-                                <?= htmlspecialchars($click['traffic_source_name'] ?? 'N/A') ?>
-                            </td>
-                            <td style="font-weight: 600;">
+                            <td><?= htmlspecialchars($click['traffic_source_name'] ?? '-') ?></td>
+                            <?php foreach ($clickTokenKeys as $tokenKey): ?>
+                                <?php $tv = $clickTokens[$tokenKey] ?? null; ?>
+                                <td class="conversion-mono"><?= htmlspecialchars($tv ?? '-') ?></td>
+                            <?php endforeach; ?>
+                            <td class="conversion-num conversion-revenue">
                                 <?php if ($click['conv_payout']): ?>
-                                    <span style="color: #2ecc71;"><?= Formatter::formatCurrency($click['conv_payout'], $userCurrency) ?></span>
+                                    <?= Formatter::formatCurrency($click['conv_payout'], $userCurrency) ?>
                                 <?php elseif ($click['conv_value']): ?>
-                                    <span style="color: #2ecc71;"><?= Formatter::formatCurrency($click['conv_value'], $userCurrency) ?></span>
+                                    <?= Formatter::formatCurrency($click['conv_value'], $userCurrency) ?>
                                 <?php else: ?>
                                     -
                                 <?php endif; ?>
@@ -578,6 +561,7 @@ function setVisitorDate(preset) {
             <div class="mobile-visitor-cards mobile-only">
                 <?php foreach ($clicks as $click): ?>
                 <?php
+                $clickTokens = $click['click_tokens'] ?? [];
                 // Device info
                 $deviceParts = [];
                 if (!empty($click['device_brand']) && !empty($click['device_model'])) {
@@ -616,7 +600,7 @@ function setVisitorDate(preset) {
                 }
                 $deviceText = implode(' / ', $deviceDisplay) ?: 'Unknown';
                 ?>
-                <div class="mobile-visitor-card <?= visitorRowClass($click) ?>">
+                <div class="mobile-visitor-card <?= visitorRowClass($click, 0) ?>">
                     <!-- Header: Status icons and timestamp -->
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--spacing-sm); border-bottom: 1px solid rgba(0,0,0,0.1); padding-bottom: var(--spacing-xs);">
                         <div style="display: flex; gap: var(--spacing-xs); align-items: center;">
@@ -677,6 +661,15 @@ function setVisitorDate(preset) {
                     <div style="font-size: 11px; color: #666; margin-bottom: var(--spacing-sm);">
                         <strong>Device:</strong> <?= htmlspecialchars($deviceText) ?>
                     </div>
+
+                    <?php if ($clickTokenKeys !== []): ?>
+                    <div style="font-size: 11px; color: #666; margin-bottom: var(--spacing-sm); display: flex; flex-direction: column; gap: 2px;">
+                        <?php foreach ($clickTokenKeys as $tokenKey): ?>
+                            <?php $tv = $clickTokens[$tokenKey] ?? null; if ($tv === null || $tv === '') continue; ?>
+                            <div><strong><?= htmlspecialchars($tokenKey) ?>:</strong> <code style="font-size: 10px;"><?= htmlspecialchars($tv) ?></code></div>
+                        <?php endforeach; ?>
+                    </div>
+                    <?php endif; ?>
                     
                     <!-- Footer: Click ID and Revenue -->
                     <div style="display: flex; justify-content: space-between; align-items: center; border-top: 1px solid rgba(0,0,0,0.1); padding-top: var(--spacing-xs); gap: 8px;">

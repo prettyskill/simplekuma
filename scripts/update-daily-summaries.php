@@ -20,7 +20,7 @@ require_once __DIR__ . '/../config/config.php';
 
 use SimpleKuma\Stats\CampaignStatsExpressions;
 use SimpleKuma\Stats\StatsViewExclusions;
-use SimpleKuma\Tracking\ConversionOptInClassifier;
+use SimpleKuma\Tracking\ConversionStatsClassifier;
 
 $db = new mysqli(DB_HOST, DB_USER, DB_PASSWORD, DB_NAME);
 
@@ -134,13 +134,19 @@ foreach ($datesToProcess as $summaryDate) {
             OR cl.extra_json LIKE '%\"classification\":\"suspected_bot\"%'
             OR cl.extra_json LIKE '%\"exclude_from_stats\":true%')";
 
-        $optInList = ConversionOptInClassifier::sqlInList();
         if ($hasOptinsCol) {
+            $convCase = ConversionStatsClassifier::conversionCountCaseSql('event_key', $db);
+            $optCase = ConversionStatsClassifier::optinCountCaseSql('event_key');
+            $revCase = ConversionStatsClassifier::conversionRevenueCaseSql(
+                'event_key',
+                'COALESCE(payout, value)',
+                $db
+            );
             $convJoin = "LEFT JOIN (
                 SELECT click_id,
-                       SUM(CASE WHEN event_key IS NULL OR event_key NOT IN ({$optInList}) THEN 1 ELSE 0 END) AS conversion_count,
-                       SUM(CASE WHEN event_key IN ({$optInList}) THEN 1 ELSE 0 END) AS optin_count,
-                       SUM(CASE WHEN event_key IS NULL OR event_key NOT IN ({$optInList}) THEN COALESCE(payout, value) ELSE 0 END) AS revenue_sum
+                       SUM({$convCase}) AS conversion_count,
+                       SUM({$optCase}) AS optin_count,
+                       SUM({$revCase}) AS revenue_sum
                 FROM conversions
                 GROUP BY click_id
             ) conv ON conv.click_id = cl.click_id";

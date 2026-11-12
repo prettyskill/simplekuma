@@ -803,6 +803,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
 
+        $conversionKeysRaw = (string) ($_POST['stats_conversion_event_keys'] ?? '');
+        $conversionKeys = \SimpleKuma\Tracking\ConversionStatsClassifier::parseFromTextarea($conversionKeysRaw);
+
         $settingsData = [
             'attribution_window_days' => $attributionWindowDays,
             'fb_capi_pixel_id' => $_POST['fb_capi_pixel_id'] ?? '',
@@ -815,9 +818,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'bot_exclude_suspected_from_stats' => isset($_POST['bot_exclude_suspected_from_stats']) ? '1' : '0',
             'archive_after_days' => $_POST['archive_after_days'] ?? '365',
             'storage_warn_percent' => (string) max(0, min(99, (int) ($_POST['storage_warn_percent'] ?? '90'))),
+            'stats_conversion_event_keys' => \SimpleKuma\Tracking\ConversionStatsClassifier::encodeForStorage($conversionKeys),
         ];
 
         if ($settings->setMultiple($settingsData)) {
+            \SimpleKuma\Tracking\ConversionStatsClassifier::clearCache();
             $success = 'Settings saved successfully';
         } else {
             $errors['general'] = 'Failed to save settings';
@@ -5460,6 +5465,27 @@ $settingsTabs = array_values(array_filter(
                                 <?php endif; ?>
                             </select>
                             <div style="font-size: 12px; color: #666; margin-top: 4px;">How long after a click that postbacks and pixels may record a conversion (default: 30 days). Unlimited never rejects for age.</div>
+                        </div>
+
+                        <div style="margin-bottom: 24px;">
+                            <label style="display: block; font-weight: 600; margin-bottom: 8px;">Events that count as Conversions / CR</label>
+                            <?php
+                            $convKeysStored = \SimpleKuma\Tracking\ConversionStatsClassifier::parseStored(
+                                $allSettings['stats_conversion_event_keys'] ?? ''
+                            );
+                            $convKeysText = $convKeysStored === [] ? '' : implode("\n", $convKeysStored);
+                            $convKeySuggestions = implode(', ', \SimpleKuma\Tracking\ConversionStatsClassifier::SUGGESTED_KEYS);
+                            ?>
+                            <textarea name="stats_conversion_event_keys"
+                                      rows="4"
+                                      placeholder="Leave empty to count all non-opt-in events (default)&#10;Example:&#10;purchase&#10;complete_payment&#10;sale"
+                                      style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px;"><?= htmlspecialchars($convKeysText) ?></textarea>
+                            <div style="font-size: 12px; color: #666; margin-top: 4px; line-height: 1.45;">
+                                One event key per line (or comma-separated). <strong>Empty = default:</strong> every non-opt-in event counts toward Dashboard / Campaign Stats Conversions, CR, and revenue.
+                                Fill this to allowlist only real sale events (e.g. <?= htmlspecialchars($convKeySuggestions) ?>) so funnel events like <code>view_content</code> / <code>add_to_cart</code> stay in the Conversion Log but do not inflate Conversions/CR.
+                                Opt-ins (<code>optin</code>, <code>lead</code>, …) never count here — they stay on the Opt-ins KPI.
+                                Changing this affects new postbacks immediately; rebuild daily summaries (cron / <code>update-daily-summaries.php</code>) to reclassify historical KPI totals.
+                            </div>
                         </div>
 
                         <div style="margin-bottom: 24px;">

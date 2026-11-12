@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace SimpleKuma\Honeycomb;
 
 use mysqli;
+use SimpleKuma\Database\SchemaProbe;
 
 /**
  * Persistence for installed Honeycomb addons.
@@ -17,8 +18,7 @@ final class AddonStore
 
     public function tableExists(): bool
     {
-        $result = $this->db->query("SHOW TABLES LIKE 'honeycomb_addons'");
-        return $result !== false && $result->num_rows > 0;
+        return SchemaProbe::tableExists($this->db, 'honeycomb_addons');
     }
 
     /**

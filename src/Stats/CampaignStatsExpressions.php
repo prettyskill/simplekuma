@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace SimpleKuma\Stats;
 
 use SimpleKuma\Tracking\ConversionOptInClassifier;
+use SimpleKuma\Tracking\ConversionStatsClassifier;
 
 /**
  * Shared SQL fragments for API stats (aligned with campaign-stats.php semantics).
@@ -327,17 +328,24 @@ class CampaignStatsExpressions
     public static function conversionsAggJoin(
         string $clAlias = 'cl',
         string $clicksTable = 'clicks',
-        bool $bindCampaignId = true
+        bool $bindCampaignId = true,
+        ?\mysqli $db = null
     ): string {
-        $optInList = ConversionOptInClassifier::sqlInList();
+        $convCase = ConversionStatsClassifier::conversionCountCaseSql('cv.event_key', $db);
+        $optCase = ConversionStatsClassifier::optinCountCaseSql('cv.event_key');
+        $revCase = ConversionStatsClassifier::conversionRevenueCaseSql(
+            'cv.event_key',
+            'COALESCE(cv.payout, cv.value)',
+            $db
+        );
         $table = ($clicksTable === 'clicks_archive') ? 'clicks_archive' : 'clicks';
         $campaignPred = $bindCampaignId ? 'clx.campaign_id = ? AND ' : '';
 
         return "LEFT JOIN (
             SELECT cv.click_id,
-                   SUM(CASE WHEN cv.event_key IS NULL OR cv.event_key NOT IN ({$optInList}) THEN 1 ELSE 0 END) AS conversion_count,
-                   SUM(CASE WHEN cv.event_key IN ({$optInList}) THEN 1 ELSE 0 END) AS optin_count,
-                   SUM(CASE WHEN cv.event_key IS NULL OR cv.event_key NOT IN ({$optInList}) THEN COALESCE(cv.payout, cv.value) ELSE 0 END) AS revenue_sum
+                   SUM({$convCase}) AS conversion_count,
+                   SUM({$optCase}) AS optin_count,
+                   SUM({$revCase}) AS revenue_sum
             FROM {$table} clx
             INNER JOIN conversions cv ON cv.click_id = clx.click_id
             WHERE {$campaignPred}clx.ts >= ? AND clx.ts <= ?
